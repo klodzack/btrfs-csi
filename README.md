@@ -170,6 +170,33 @@ parameters:
 
 Prepare btrfs pools under `/var/lib/btrfs-csi/<pool-name>` on each storage node, then use the normal deployment overlays. Pool paths and names are local to each node; use the same pool name on nodes that should serve the same StorageClass. Nodes without valid pools cannot provision volumes. Keep `--nodeid` set to the Kubernetes node name, as the DaemonSet does.
 
+By default, the DaemonSet targets every eligible node: prepare pools on **all** of them. In a mixed storage/non-storage cluster, label only prepared storage nodes:
+
+```bash
+kubectl label node worker-1 storage.btrfs.csi.local/enabled=true
+```
+
+Add this strategic-merge patch to your deployment's kustomize overlay, retaining any existing node selectors:
+
+```yaml
+patches:
+  - target:
+      kind: DaemonSet
+      name: btrfs-csi-driver
+    patch: |-
+      apiVersion: apps/v1
+      kind: DaemonSet
+      metadata:
+        name: btrfs-csi-driver
+      spec:
+        template:
+          spec:
+            nodeSelector:
+              storage.btrfs.csi.local/enabled: "true"
+```
+
+Use this administrator-managed label, not the topology label that the driver registers after startup. Without targeting, unprepared nodes run crashing driver pods; their unavailability can also consume the DaemonSet's rolling-update budget and stall upgrades. Label and prepare a new storage node before making it eligible, and keep the selector in your overlay for subsequent deployments.
+
 Use `WaitForFirstConsumer` StorageClasses and let the scheduler place pods. To select a storage node for a new volume, use a pod `nodeSelector`, not `spec.nodeName`, which bypasses scheduling.
 
 Volumes are not replicated or moved between nodes. If a storage node is unavailable, consumers of its volumes remain pending until that node returns. Deletion also waits for the owning node; do not remove PV finalizers as a substitute for deleting the on-disk data.
@@ -191,6 +218,18 @@ The bundled snapshot controller enables distributed snapshotting. If your cluste
 No volume handles, pool paths, or state files change. Before adding storage nodes, inspect every existing PV for this driver: the older deployment did not explicitly enable the provisioner's topology feature, so some PVs may have no node affinity. Such PVs are not safe to use in a multi-node cluster.
 
 PVs that already have the correct required node affinity need no changes. For an affected PV, back up its manifest and data, stop its consumers, set its reclaim policy to `Retain`, and use Kubernetes' retained-volume recovery procedure to rebind a replacement PV with the same CSI volume handle and required affinity to the original node. Do not add nodes or resume consumers until every existing PV is correctly pinned. Do not delete the backing subvolume or pool state during recovery.
+
+Pause new provisioning while upgrading the driver. After every old provisioner has stopped and the updated DaemonSet has finished rolling out, remove only this driver's legacy centrally managed capacity reports:
+
+```bash
+kubectl -n btrfs-csi rollout status daemonset/btrfs-csi-driver --timeout=180s
+kubectl -n btrfs-csi delete csistoragecapacities \
+  -l 'csi.storage.k8s.io/drivername=btrfs.csi.local,csi.storage.k8s.io/managed-by=external-provisioner'
+kubectl -n btrfs-csi get csistoragecapacities \
+  -l 'csi.storage.k8s.io/drivername=btrfs.csi.local'
+```
+
+Use your deployment's namespace if different. Verify that the remaining reports use node-specific `csi.storage.k8s.io/managed-by=external-provisioner-<node-name>` identities and that each storage node reports capacity for its StorageClasses before resuming provisioning. The old `external-provisioner` reports survive a rolling upgrade because their DaemonSet owner survives; the new per-node provisioners do not manage them. A stale optimistic report can cause the scheduler to select storage that no longer has enough capacity. Do not delete other drivers' reports or the current node-specific reports.
 
 Before switching snapshotters to distributed mode, label existing VolumeSnapshotContents for this driver with the node holding their data:
 
@@ -570,7 +609,7 @@ make minikube-e2e
 make minikube-down
 ```
 
-For two-node coverage, start minikube with `--nodes=2`, prepare both nodes with `bash scripts/ci/setup.sh`, and run `make minikube-e2e-multinode`. This checks ownership, pod replacement, expansion, snapshots, local clones/restores, quotas, capacity reporting, restart, and deletion on both nodes.
+For two-node coverage, start minikube with `--nodes=2`, prepare both nodes with `bash scripts/ci/setup.sh`, and run `make minikube-e2e-multinode`. This checks ownership, pod replacement, usable capacity after expansion, snapshots, local clones/restores, quotas, capacity reporting, legacy capacity cleanup, restart, and deletion on both nodes. Run this only on an isolated test cluster: the mixed-node case temporarily unmounts the second node's pools to verify storage-node targeting and rolling updates, then restores the pools, labels, and selector.
 
 ### Project Structure
 

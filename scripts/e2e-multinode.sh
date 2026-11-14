@@ -1,10 +1,33 @@
 #!/usr/bin/env bash
 # Requires an isolated minikube cluster with at least two prepared storage nodes.
+# Temporarily unmounts the second node's pools and changes DaemonSet targeting;
+# the original pools, labels, and selector are restored on exit.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${NAMESPACE:=btrfs-csi-multinode-e2e}"
 source "${SCRIPT_DIR}/common.sh"
+
+mixed_active=false
+mixed_node=""
+mixed_default_source=""
+mixed_secondary_source=""
+mixed_selector=""
+mixed_labels=""
+
+restore_mixed_nodes() {
+    ${MK} ssh --node="${mixed_node}" -- \
+        "mountpoint -q '${BTRFS_MOUNT_1}' || sudo mount '${mixed_default_source}' '${BTRFS_MOUNT_1}'"
+    ${MK} ssh --node="${mixed_node}" -- \
+        "mountpoint -q '${BTRFS_MOUNT_2}' || sudo mount '${mixed_secondary_source}' '${BTRFS_MOUNT_2}'"
+    for node in "${nodes[@]:0:2}"; do
+        ${K} patch node "${node}" --type=merge \
+            -p "$(jq -c --arg node "${node}" '.[] | select(.name == $node) | .patch' <<<"${mixed_labels}")"
+    done
+    ${K} patch daemonset btrfs-csi-driver -n btrfs-csi --type=json -p "${mixed_selector}"
+    ${K} rollout status daemonset/btrfs-csi-driver -n btrfs-csi --timeout=180s
+    mixed_active=false
+}
 
 cleanup() {
     local rc=$?
@@ -13,6 +36,11 @@ cleanup() {
         ${K} get events -n "${NAMESPACE}" --sort-by=.lastTimestamp || true
         ${K} logs -n btrfs-csi -l app=btrfs-csi-driver --all-containers --tail=40 --prefix || true
     fi
+    if "${mixed_active}"; then
+        restore_mixed_nodes || true
+    fi
+    ${K} delete csistoragecapacities -n btrfs-csi \
+        e2e-legacy-capacity-0 e2e-legacy-capacity-1 e2e-legacy-capacity-other --ignore-not-found || true
     ${K} delete namespace "${NAMESPACE}" --ignore-not-found --wait=true --timeout=180s || true
 }
 trap cleanup EXIT
@@ -82,6 +110,19 @@ ready() {
     ${K} wait -n "${NAMESPACE}" --for=condition=Ready "pod/$1" --timeout=180s
 }
 
+check_quota() {
+    local pod="$1" below="$2" above="$3"
+    ${K} exec -n "${NAMESPACE}" "${pod}" -- sh -ec \
+        "dd if=/dev/zero of=/data/quota-check bs=1M count=${below} conv=fsync; rm /data/quota-check; sync"
+    ${K} exec -n "${NAMESPACE}" "${pod}" -- sh -ec \
+        "if dd if=/dev/zero of=/data/quota-check bs=1M count=${above} conv=fsync 2>/dev/null; then
+            rm /data/quota-check
+            exit 1
+        fi
+        rm /data/quota-check
+        sync"
+}
+
 check_storage() {
     local owner="$1" id="$2" name="$3" node count=0 records
     for node in "${nodes[@]}"; do
@@ -122,8 +163,7 @@ for index in 0 1; do
     ${K} patch pvc "${name}" -n "${NAMESPACE}" --type=merge \
         -p '{"spec":{"resources":{"requests":{"storage":"128Mi"}}}}'
     ${K} wait -n "${NAMESPACE}" "pvc/${name}" --for=jsonpath='{.status.capacity.storage}'=128Mi --timeout=180s
-    ${K} exec -n "${NAMESPACE}" "${name}" -- sh -c \
-        'if dd if=/dev/zero of=/data/overflow bs=1M count=160 2>/dev/null; then exit 1; fi; rm -f /data/overflow'
+    check_quota "${name}" 96 160
 
     echo "==> Testing snapshot and same-node clone/restore..."
     ${K} apply -f - <<EOF
@@ -160,6 +200,7 @@ EOF
     ready "${name}"
     [ "$(${K} get pod "${name}" -n "${NAMESPACE}" -o jsonpath='{.spec.nodeName}')" = "${node}" ]
     ${K} wait -n "${NAMESPACE}" "pvc/${name}" --for=jsonpath='{.status.capacity.storage}'=192Mi --timeout=180s
+    check_quota "${name}" 160 224
     ${K} exec -n "${NAMESPACE}" "${name}" -- grep persistent-data /data/value
 
     echo "==> Testing conflicting scheduling and driver restart..."
@@ -187,4 +228,81 @@ for node in "${nodes[@]:0:2}"; do
         .nodeTopology.matchLabels["topology.btrfs.csi.local/node"] == $node and
         .capacity != "0")'
 done
+
+echo "==> Testing cleanup of legacy capacity reports after a rolling upgrade..."
+capacity_before=$(${K} get csistoragecapacities -n btrfs-csi \
+    -l csi.storage.k8s.io/drivername=btrfs.csi.local -o json |
+    jq -c --arg sc "${PRIMARY_STORAGECLASS}" '[.items[] | select(.storageClassName == $sc) | .metadata.uid] | sort')
+owner=$(${K} get daemonset btrfs-csi-driver -n btrfs-csi -o jsonpath='{.metadata.uid}')
+for index in 0 1 other; do
+    driver=btrfs.csi.local
+    sc="${PRIMARY_STORAGECLASS}"
+    if [ "${index}" = other ]; then
+        driver=other.csi.local
+        sc="other-driver"
+    fi
+    ${K} apply -f - <<EOF
+apiVersion: storage.k8s.io/v1
+kind: CSIStorageCapacity
+metadata:
+  name: e2e-legacy-capacity-${index}
+  namespace: btrfs-csi
+  labels:
+    csi.storage.k8s.io/drivername: ${driver}
+    csi.storage.k8s.io/managed-by: external-provisioner
+  ownerReferences:
+    - apiVersion: apps/v1
+      kind: DaemonSet
+      name: btrfs-csi-driver
+      uid: ${owner}
+storageClassName: ${sc}
+nodeTopology:
+  matchLabels:
+    topology.btrfs.csi.local/node: ${nodes[0]}
+capacity: 1Ti
+EOF
+done
+${K} rollout restart daemonset/btrfs-csi-driver -n btrfs-csi
+${K} rollout status daemonset/btrfs-csi-driver -n btrfs-csi --timeout=180s
+legacy_selector='csi.storage.k8s.io/drivername=btrfs.csi.local,csi.storage.k8s.io/managed-by=external-provisioner'
+${K} get csistoragecapacities -n btrfs-csi -l "${legacy_selector}" -o json |
+    jq -e --arg owner "${owner}" '.items | length == 2 and all(.[]; .metadata.ownerReferences[0].uid == $owner)'
+${K} -n btrfs-csi delete csistoragecapacities -l "${legacy_selector}"
+${K} get csistoragecapacities -n btrfs-csi -l "${legacy_selector}" -o json | jq -e '.items | length == 0'
+${K} get csistoragecapacities -n btrfs-csi \
+    -l csi.storage.k8s.io/drivername=btrfs.csi.local -o json |
+    jq -e --arg sc "${PRIMARY_STORAGECLASS}" --argjson before "${capacity_before}" \
+        '[.items[] | select(.storageClassName == $sc) | .metadata.uid] | sort | . == $before'
+${K} get csistoragecapacity e2e-legacy-capacity-other -n btrfs-csi >/dev/null
+
+echo "==> Testing deployment targeting with an unprepared worker..."
+mixed_node="${nodes[1]}"
+mixed_default_source=$(${MK} ssh --node="${mixed_node}" -- \
+    "findmnt --noheadings --output SOURCE --mountpoint '${BTRFS_MOUNT_1}'" | tr -d '\r')
+mixed_secondary_source=$(${MK} ssh --node="${mixed_node}" -- \
+    "findmnt --noheadings --output SOURCE --mountpoint '${BTRFS_MOUNT_2}'" | tr -d '\r')
+mixed_selector=$(${K} get daemonset btrfs-csi-driver -n btrfs-csi -o json |
+    jq -c '[{op: "add", path: "/spec/template/spec/nodeSelector", value: .spec.template.spec.nodeSelector}]')
+mixed_labels=$(${K} get nodes "${nodes[@]:0:2}" -o json | jq -c '
+    [.items[] | {name: .metadata.name, patch: {metadata: {labels: {
+        "storage.btrfs.csi.local/enabled": .metadata.labels["storage.btrfs.csi.local/enabled"]
+    }}}}]')
+mixed_active=true
+${K} label node "${nodes[0]}" storage.btrfs.csi.local/enabled=true --overwrite
+${K} patch node "${mixed_node}" --type=merge -p '{"metadata":{"labels":{"storage.btrfs.csi.local/enabled":null}}}'
+${K} patch daemonset btrfs-csi-driver -n btrfs-csi --type=merge \
+    -p '{"spec":{"template":{"spec":{"nodeSelector":{"storage.btrfs.csi.local/enabled":"true"}}}}}'
+${K} delete pod -n btrfs-csi -l app=btrfs-csi-driver \
+    --field-selector "spec.nodeName=${mixed_node}" --ignore-not-found --wait=true
+${K} rollout status daemonset/btrfs-csi-driver -n btrfs-csi --timeout=180s
+${MK} ssh --node="${mixed_node}" -- "sudo umount '${BTRFS_MOUNT_1}' '${BTRFS_MOUNT_2}'"
+${MK} ssh --node="${mixed_node}" -- \
+    "test -z \"\$(findmnt --noheadings --types btrfs --output TARGET | sed -n '\|^${POOLS_DIR}/|p')\""
+${K} rollout restart daemonset/btrfs-csi-driver -n btrfs-csi
+${K} rollout status daemonset/btrfs-csi-driver -n btrfs-csi --timeout=180s
+${K} get daemonset btrfs-csi-driver -n btrfs-csi -o json | jq -e '
+    .status.desiredNumberScheduled == 1 and .status.numberReady == 1 and .status.updatedNumberScheduled == 1'
+${K} get pods -n btrfs-csi -l app=btrfs-csi-driver -o json |
+    jq -e --arg node "${nodes[0]}" '.items | length == 1 and .[0].spec.nodeName == $node'
+restore_mixed_nodes
 echo "Multi-node E2E tests passed."
