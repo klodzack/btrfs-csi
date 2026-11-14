@@ -334,7 +334,7 @@ func (d *Driver) NodeGetVolumeStats(ctx context.Context,
 	}, nil
 }
 
-func (d *Driver) NodeExpandVolume(_ context.Context,
+func (d *Driver) NodeExpandVolume(ctx context.Context,
 	req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
 	klog.V(5).InfoS("NodeExpandVolume called", "volumeID", req.GetVolumeId())
 
@@ -348,13 +348,12 @@ func (d *Driver) NodeExpandVolume(_ context.Context,
 		return nil, err
 	}
 
-	vol, ok := d.store.GetVolume(req.GetVolumeId())
-	if !ok {
-		return nil, status.Errorf(codes.NotFound, "volume %s not found", req.GetVolumeId())
+	capacity, err := d.expandVolume(ctx, req.GetVolumeId(), req.GetCapacityRange())
+	if err != nil {
+		return nil, err
 	}
 
-	// Node expansion is not required for this driver (handled by ControllerExpandVolume).
-	return &csi.NodeExpandVolumeResponse{CapacityBytes: vol.CapacityBytes}, nil
+	return &csi.NodeExpandVolumeResponse{CapacityBytes: capacity}, nil
 }
 
 // Ensure Driver implements the CSI Node server (compile-time check).

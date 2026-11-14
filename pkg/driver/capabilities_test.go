@@ -24,7 +24,6 @@ func TestControllerGetCapabilities(t *testing.T) {
 		csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME:   false,
 		csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT: false,
 		csi.ControllerServiceCapability_RPC_CLONE_VOLUME:           false,
-		csi.ControllerServiceCapability_RPC_EXPAND_VOLUME:          false,
 		csi.ControllerServiceCapability_RPC_GET_CAPACITY:           false,
 		csi.ControllerServiceCapability_RPC_LIST_VOLUMES:           false,
 		csi.ControllerServiceCapability_RPC_LIST_SNAPSHOTS:         false,

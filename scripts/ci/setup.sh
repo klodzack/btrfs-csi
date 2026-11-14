@@ -11,19 +11,24 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../common.sh"
 
-echo "==> Loading btrfs kernel module on host..."
-sudo modprobe btrfs
+if ! grep -qw btrfs /proc/filesystems; then
+    echo "==> Loading btrfs kernel module on host..."
+    sudo modprobe btrfs
+fi
 
-echo "==> Installing btrfs-progs in minikube node..."
-${EXEC} "sudo apt-get update -qq && sudo apt-get install -y -qq btrfs-progs"
+for node in $(${K} get nodes -o jsonpath='{.items[*].metadata.name}'); do
+    echo "==> Installing btrfs-progs in ${node}..."
+    ${MK} ssh --node="${node}" -- "sudo apt-get update -qq && sudo apt-get install -y -qq btrfs-progs"
 
-echo "==> Creating loop-backed btrfs filesystems..."
-${EXEC} "sudo bash -c '
+    echo "==> Creating loop-backed btrfs filesystems on ${node}..."
+    ${MK} ssh --node="${node}" -- "sudo bash -ec '
   truncate -s 512M /tmp/btrfs1.img
   truncate -s 512M /tmp/btrfs2.img
   LOOP1=\$(losetup -f)
+  test -b \"\$LOOP1\" || mknod \"\$LOOP1\" b 7 \"\${LOOP1#/dev/loop}\"
   losetup \"\$LOOP1\" /tmp/btrfs1.img
   LOOP2=\$(losetup -f)
+  test -b \"\$LOOP2\" || mknod \"\$LOOP2\" b 7 \"\${LOOP2#/dev/loop}\"
   losetup \"\$LOOP2\" /tmp/btrfs2.img
   mkfs.btrfs -f \"\$LOOP1\"
   mkfs.btrfs -f \"\$LOOP2\"
@@ -31,6 +36,7 @@ ${EXEC} "sudo bash -c '
   mount \"\$LOOP1\" ${BTRFS_MOUNT_1}
   mount \"\$LOOP2\" ${BTRFS_MOUNT_2}
 '"
+done
 
 echo "==> Building driver image..."
 _VERSION="${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo dev)}"

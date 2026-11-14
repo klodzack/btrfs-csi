@@ -3,7 +3,7 @@
 [![Go Version](https://img.shields.io/github/go-mod/go-version/mporrato/btrfs-csi)](https://github.com/mporrato/btrfs-csi)
 [![License: Unlicense](https://img.shields.io/badge/License-Unlicense-green.svg)](LICENSE)
 
-A Kubernetes CSI storage driver for single-node clusters that exposes btrfs features—instant volumes, snapshots, clones, and true quota enforcement—directly to Kubernetes workloads.
+A Kubernetes CSI storage driver for node-local storage on single- or multi-node clusters that exposes btrfs features—instant volumes, snapshots, clones, and true quota enforcement—directly to Kubernetes workloads.
 
 ## Why btrfs?
 
@@ -38,6 +38,8 @@ Btrfs is a copy-on-write filesystem with built-in volume management. This driver
 **What btrfs does:** Resize qgroup limits instantly; the filesystem expands online.
 **Kubernetes mapping:** Patch a PVC's capacity; the volume grows without downtime.
 **Why it matters:** No unmount, no resize operations, no service interruption. Just update the PVC and use the extra space immediately.
+
+Expansion is performed by kubelet on the volume's node. Mounted volumes expand online; unused volumes finish expanding when next mounted by a pod.
 
 ### 7. Cross-Filesystem Clones
 **What btrfs does:** Send/receive streams enable cloning across different btrfs filesystems.
@@ -158,11 +160,85 @@ parameters:
   cow: "false"  # disables CoW with chattr +C
 ```
 
-**Topology:** The driver uses the topology key `topology.btrfs.csi.local/node`. `WaitForFirstConsumer` ensures the PVC binds to a PV on the same node where the consuming pod is scheduled, which is required for single-node storage.
+**Topology:** The driver uses the topology key `topology.btrfs.csi.local/node`. With `WaitForFirstConsumer`, only the provisioner on the first consumer's selected node creates the volume. The resulting PV has required node affinity, so every subsequent consumer is scheduled on that same node.
 
 **When to use each:**
 - `cow: "true"` (default): Web servers, log aggregation, general applications—benefits from CoW efficiency
 - `cow: "false"`: PostgreSQL, MySQL, Elasticsearch, VMs—workloads that do their own caching and suffer from CoW write amplification
+
+### Multi-Node Clusters
+
+Prepare btrfs pools under `/var/lib/btrfs-csi/<pool-name>` on each storage node, then use the normal deployment overlays. Pool paths and names are local to each node; use the same pool name on nodes that should serve the same StorageClass. Nodes without valid pools cannot provision volumes. Keep `--nodeid` set to the Kubernetes node name, as the DaemonSet does.
+
+By default, the DaemonSet targets every eligible node: prepare pools on **all** of them. In a mixed storage/non-storage cluster, label only prepared storage nodes:
+
+```bash
+kubectl label node worker-1 storage.btrfs.csi.local/enabled=true
+```
+
+Add this strategic-merge patch to your deployment's kustomize overlay, retaining any existing node selectors:
+
+```yaml
+patches:
+  - target:
+      kind: DaemonSet
+      name: btrfs-csi-driver
+    patch: |-
+      apiVersion: apps/v1
+      kind: DaemonSet
+      metadata:
+        name: btrfs-csi-driver
+      spec:
+        template:
+          spec:
+            nodeSelector:
+              storage.btrfs.csi.local/enabled: "true"
+```
+
+Use this administrator-managed label, not the topology label that the driver registers after startup. Without targeting, unprepared nodes run crashing driver pods; their unavailability can also consume the DaemonSet's rolling-update budget and stall upgrades. Label and prepare a new storage node before making it eligible, and keep the selector in your overlay for subsequent deployments.
+
+Use `WaitForFirstConsumer` StorageClasses and let the scheduler place pods. To select a storage node for a new volume, use a pod `nodeSelector`, not `spec.nodeName`, which bypasses scheduling.
+
+Volumes are not replicated or moved between nodes. If a storage node is unavailable, consumers of its volumes remain pending until that node returns. Deletion also waits for the owning node; do not remove PV finalizers as a substitute for deleting the on-disk data.
+
+Snapshots, restores, and clones remain on the source node, including transfers between pools on that node. For a clone or snapshot restore, select the source node in the consuming pod:
+
+```yaml
+spec:
+  nodeSelector:
+    topology.btrfs.csi.local/node: worker-1
+```
+
+Find the source node in the source PV's `.spec.nodeAffinity`. For restores after the source PVC has been deleted, record the node from the snapshot content's `snapshot.storage.kubernetes.io/managed-by` label. A consumer selecting another node cannot restore or clone the local data.
+
+The bundled snapshot controller enables distributed snapshotting. If your cluster manages its own snapshot controller, configure it with `--enable-distributed-snapshotting` and grant its service account `get`, `list`, and `watch` on nodes. Each driver snapshotter uses `--node-deployment` and `NODE_NAME`; these settings must be enabled together.
+
+#### Upgrading Existing Installations
+
+No volume handles, pool paths, or state files change. Before adding storage nodes, inspect every existing PV for this driver: the older deployment did not explicitly enable the provisioner's topology feature, so some PVs may have no node affinity. Such PVs are not safe to use in a multi-node cluster.
+
+PVs that already have the correct required node affinity need no changes. For an affected PV, back up its manifest and data, stop its consumers, set its reclaim policy to `Retain`, and use Kubernetes' retained-volume recovery procedure to rebind a replacement PV with the same CSI volume handle and required affinity to the original node. Do not add nodes or resume consumers until every existing PV is correctly pinned. Do not delete the backing subvolume or pool state during recovery.
+
+Pause new provisioning while upgrading the driver. After every old provisioner has stopped and the updated DaemonSet has finished rolling out, remove only this driver's legacy centrally managed capacity reports:
+
+```bash
+kubectl -n btrfs-csi rollout status daemonset/btrfs-csi-driver --timeout=180s
+kubectl -n btrfs-csi delete csistoragecapacities \
+  -l 'csi.storage.k8s.io/drivername=btrfs.csi.local,csi.storage.k8s.io/managed-by=external-provisioner'
+kubectl -n btrfs-csi get csistoragecapacities \
+  -l 'csi.storage.k8s.io/drivername=btrfs.csi.local'
+```
+
+Use your deployment's namespace if different. Verify that the remaining reports use node-specific `csi.storage.k8s.io/managed-by=external-provisioner-<node-name>` identities and that each storage node reports capacity for its StorageClasses before resuming provisioning. The old `external-provisioner` reports survive a rolling upgrade because their DaemonSet owner survives; the new per-node provisioners do not manage them. A stale optimistic report can cause the scheduler to select storage that no longer has enough capacity. Do not delete other drivers' reports or the current node-specific reports.
+
+Before switching snapshotters to distributed mode, label existing VolumeSnapshotContents for this driver with the node holding their data:
+
+```bash
+kubectl label volumesnapshotcontent <content-name> \
+  snapshot.storage.kubernetes.io/managed-by=<source-node>
+```
+
+Apply this to retained and imported snapshots too; derive the node from the source PV or your storage inventory, never guess. Existing contents are not automatically backfilled by the upstream controller. New dynamic snapshots receive the label automatically. Configure the snapshot controller before rolling out the updated driver.
 
 ### Snapshots
 
@@ -532,6 +608,8 @@ make minikube-e2e
 # Tear down the test cluster
 make minikube-down
 ```
+
+For two-node coverage, start minikube with `--nodes=2`, prepare both nodes with `bash scripts/ci/setup.sh`, and run `make minikube-e2e-multinode`. This checks ownership, pod replacement, usable capacity after expansion, snapshots, local clones/restores, quotas, capacity reporting, legacy capacity cleanup, restart, and deletion on both nodes. Run this only on an isolated test cluster: the mixed-node case temporarily unmounts the second node's pools to verify storage-node targeting and rolling updates, then restores the pools, labels, and selector.
 
 ### Project Structure
 

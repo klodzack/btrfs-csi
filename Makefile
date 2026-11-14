@@ -11,7 +11,7 @@ LDFLAGS    := -X github.com/mporrato/btrfs-csi/pkg/driver.Version=$(VERSION)
 FUZZTIME ?= 30s
 
 .PHONY: build test test-fuzz test-integration lint mod image deploy \
-        minikube-up minikube-down minikube-sanity minikube-e2e
+        minikube-up minikube-down minikube-sanity minikube-e2e minikube-e2e-multinode
 
 lint:
 	$(PRECOMMIT) run --all-files
@@ -67,6 +67,9 @@ minikube-sanity:
 # Run end-to-end tests against the deployed cluster.
 minikube-e2e:
 	CLUSTER=$(CLUSTER) bash scripts/e2e.sh
+
+minikube-e2e-multinode:
+	CLUSTER=$(CLUSTER) bash scripts/e2e-multinode.sh
 
 clean:
 	rm -rf bin/

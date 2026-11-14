@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,7 +23,7 @@ import (
 
 const topologyKey = "topology.btrfs.csi.local/node"
 
-// supportedAccessModes is the set of access modes this single-node driver supports.
+// supportedAccessModes is the set of access modes supported by node-local storage.
 var supportedAccessModes = map[csi.VolumeCapability_AccessMode_Mode]struct{}{
 	csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER:        {},
 	csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY:   {},
@@ -36,7 +37,6 @@ func (d *Driver) ControllerGetCapabilities(_ context.Context,
 		csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
 		csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT,
 		csi.ControllerServiceCapability_RPC_CLONE_VOLUME,
-		csi.ControllerServiceCapability_RPC_EXPAND_VOLUME,
 		csi.ControllerServiceCapability_RPC_GET_CAPACITY,
 		csi.ControllerServiceCapability_RPC_LIST_VOLUMES,
 		csi.ControllerServiceCapability_RPC_LIST_SNAPSHOTS,
@@ -54,6 +54,9 @@ func (d *Driver) ControllerGetCapabilities(_ context.Context,
 }
 
 func (d *Driver) GetCapacity(_ context.Context, req *csi.GetCapacityRequest) (*csi.GetCapacityResponse, error) {
+	if !d.matchesTopology(req.AccessibleTopology) {
+		return &csi.GetCapacityResponse{}, nil
+	}
 	basePath, err := d.resolveBasePath(req.Parameters)
 	if err != nil {
 		return nil, err
@@ -257,6 +260,20 @@ func validateCreateVolumeCapabilities(caps []*csi.VolumeCapability) error {
 	return nil
 }
 
+func (d *Driver) validateCreateVolumeRequest(req *csi.CreateVolumeRequest) error {
+	if req.Name == "" {
+		return status.Error(codes.InvalidArgument, "volume name is required")
+	}
+	if err := validateCreateVolumeCapabilities(req.VolumeCapabilities); err != nil {
+		return err
+	}
+	requisite := req.GetAccessibilityRequirements().GetRequisite()
+	if len(requisite) > 0 && !slices.ContainsFunc(requisite, d.matchesTopology) {
+		return status.Errorf(codes.ResourceExhausted, "requested topology is not accessible on node %q", d.nodeID)
+	}
+	return nil
+}
+
 // parseCowParameter extracts and validates the "cow" parameter from the volume
 // creation parameters. Defaults to CoW enabled (nodatacow=false) when not specified.
 // Only "true" and "false" (case-insensitive) are accepted.
@@ -344,10 +361,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	if err := ctx.Err(); err != nil {
 		return nil, status.FromContextError(err).Err()
 	}
-	if req.Name == "" {
-		return nil, status.Error(codes.InvalidArgument, "volume name is required")
-	}
-	if err := validateCreateVolumeCapabilities(req.VolumeCapabilities); err != nil {
+	if err := d.validateCreateVolumeRequest(req); err != nil {
 		return nil, err
 	}
 
@@ -466,53 +480,56 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 
 func (d *Driver) ControllerExpandVolume(ctx context.Context,
 	req *csi.ControllerExpandVolumeRequest) (*csi.ControllerExpandVolumeResponse, error) {
-	if req.VolumeId == "" {
-		return nil, status.Error(codes.InvalidArgument, "volume ID is required")
+	// Retained for existing CSI clients, but not advertised: Kubernetes must
+	// expand on the owning node rather than a cluster-wide resizer's node.
+	capacity, err := d.expandVolume(ctx, req.VolumeId, req.CapacityRange)
+	if err != nil {
+		return nil, err
 	}
+	return &csi.ControllerExpandVolumeResponse{CapacityBytes: capacity}, nil
+}
 
+func (d *Driver) expandVolume(ctx context.Context, volumeID string, capacityRange *csi.CapacityRange) (int64, error) {
+	if volumeID == "" {
+		return 0, status.Error(codes.InvalidArgument, "volume ID is required")
+	}
 	d.controllerMu.Lock()
 	defer d.controllerMu.Unlock()
 
-	vol, ok := d.store.GetVolume(req.VolumeId)
+	vol, ok := d.store.GetVolume(volumeID)
 	if !ok {
-		return nil, status.Errorf(codes.NotFound, "volume %s not found", req.VolumeId)
+		return 0, status.Errorf(codes.NotFound, "volume %s not found", volumeID)
 	}
 
-	newCapacity, err := capacityFromRange(req.CapacityRange)
+	newCapacity, err := capacityFromRange(capacityRange)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 
 	// Reject shrink attempts.
 	if newCapacity > 0 && newCapacity < vol.CapacityBytes {
-		return nil, status.Errorf(codes.InvalidArgument, "cannot shrink volume from %d to %d", vol.CapacityBytes, newCapacity)
+		return 0, status.Errorf(codes.InvalidArgument, "cannot shrink volume from %d to %d", vol.CapacityBytes, newCapacity)
 	}
 
 	// If no capacity specified or same as current, nothing to do.
 	if newCapacity == 0 || newCapacity == vol.CapacityBytes {
-		return &csi.ControllerExpandVolumeResponse{
-			CapacityBytes:         vol.CapacityBytes,
-			NodeExpansionRequired: false,
-		}, nil
+		return vol.CapacityBytes, nil
 	}
 
 	// Update qgroup limit (ensures quota is enabled first in case the volume
 	// was originally created with zero capacity and no quota set up).
 	if err := d.applyCapacityLimit(ctx, vol.BasePath, vol.Path(), newCapacity); err != nil {
-		return nil, status.Errorf(codes.Internal, "apply capacity limit: %v", err)
+		return 0, status.Errorf(codes.Internal, "apply capacity limit: %v", err)
 	}
 
 	// Update state.
 	vol.CapacityBytes = newCapacity
 	if err := d.store.SaveVolume(vol); err != nil {
-		return nil, status.Errorf(codes.Internal, "save volume state: %v", err)
+		return 0, status.Errorf(codes.Internal, "save volume state: %v", err)
 	}
 
-	klog.V(4).InfoS("ControllerExpandVolume", "volumeID", req.VolumeId, "newCapacity", newCapacity)
-	return &csi.ControllerExpandVolumeResponse{
-		CapacityBytes:         newCapacity,
-		NodeExpansionRequired: false,
-	}, nil
+	klog.V(4).InfoS("ExpandVolume", "volumeID", volumeID, "newCapacity", newCapacity)
+	return newCapacity, nil
 }
 
 // provisionVolume creates the subvolume at subvolPath, handling content sources for cloning.
@@ -816,4 +833,13 @@ func toCSIVolume(vol *state.Volume, nodeID string) *csi.Volume {
 		}
 	}
 	return v
+}
+
+func (d *Driver) matchesTopology(topology *csi.Topology) bool {
+	for key, value := range topology.GetSegments() {
+		if key != topologyKey || value != d.nodeID {
+			return false
+		}
+	}
+	return true
 }

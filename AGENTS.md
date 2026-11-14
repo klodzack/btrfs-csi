@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-btrfs-csi is a Kubernetes CSI (Container Storage Interface) storage driver for single-node clusters (e.g., k0s) that leverages btrfs features: subvolumes, snapshots, qgroups, and copy-on-write.
+btrfs-csi is a Kubernetes CSI (Container Storage Interface) storage driver for node-local storage on single- and multi-node clusters that leverages btrfs features: subvolumes, snapshots, qgroups, and copy-on-write.
 
 Written in Go. Single binary serving Identity, Controller, and Node gRPC services over a Unix socket.
 
@@ -111,9 +111,12 @@ The pre-commit hook passes `GOTOOLCHAIN=auto` to `golangci-lint run`, but that o
 
 ## Important Context
 
-- This is a **single-node** driver: no `ControllerPublish/Unpublish`, no `NodeStage/Unstage`
+- Storage is **node-local**: distributed provisioners create each volume on one node, and PV node affinity pins all consumers there. No replication, cross-node migration, `ControllerPublish/Unpublish`, or `NodeStage/Unstage`.
+- Expansion runs in `NodeExpandVolume`; controller expansion is not advertised. Unused volumes finish expanding when next mounted.
+- Snapshotters use distributed snapshotting. Clones and restores require a consumer selecting the source node; existing snapshot contents need the managed-by node label when upgrading.
 - The btrfs layer uses CLI (`btrfs` command) via `os/exec`, not kernel ioctls
 - Quota enforcement uses simple quotas (`--simple`) when available, falls back to traditional qgroups
 - All CSI operations must be **idempotent** per the CSI spec
 - Capacity is enforced via qgroup limits, not filesystem-level sizing
 - Storage capacity tracking is enabled (`--enable-capacity`): the provisioner reports `CSIStorageCapacity` objects to prevent over-provisioning
+- The pinned provisioner requires explicit `--feature-gates=Topology=true` to put node affinity on PVs; keep this enabled with `--node-deployment` and `--strict-topology`.
