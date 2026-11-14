@@ -103,3 +103,21 @@ jobs:
         run: bash scripts/sanity.sh
       - name: Run e2e tests
         run: bash scripts/e2e.sh
+
+  multinode-e2e:
+    name: Multi-Node E2E Tests
+    needs: [unit-test, integration-test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: medyagh/setup-minikube@e9e035a86bbc3caea26a450bd4dbf9d0c453682e # v0.0.21
+        with:
+          driver: docker
+          cpus: 2
+          memory: 2048
+          start-args: --profile=btrfs-csi --nodes=2
+      - name: Set up btrfs on both nodes and deploy driver
+        run: bash scripts/ci/setup.sh
+      - name: Run multi-node e2e tests
+        run: make minikube-e2e-multinode

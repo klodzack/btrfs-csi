@@ -95,9 +95,8 @@ spec:
 EOF
 }
 
-# run_pod <name> <pvc> <command>
-# Creates a busybox pod mounting the PVC at /data, waits for completion, deletes it.
-run_pod() {
+# start_pod <name> <pvc> <command>
+start_pod() {
     local name="$1" pvc="$2" cmd="$3"
     ${K} apply -f - <<EOF
 apiVersion: v1
@@ -109,6 +108,7 @@ metadata:
     btrfs-csi-e2e: "true"
 spec:
   restartPolicy: Never
+  terminationGracePeriodSeconds: 1
   containers:
     - name: main
       image: busybox
@@ -121,6 +121,13 @@ spec:
       persistentVolumeClaim:
         claimName: ${pvc}
 EOF
+}
+
+# run_pod <name> <pvc> <command>
+# Creates a busybox pod mounting the PVC at /data, waits for completion, deletes it.
+run_pod() {
+    local name="$1" pvc="$2" cmd="$3"
+    start_pod "${name}" "${pvc}" "${cmd}"
     wait_until 120 "${K} get pod ${name} -n ${NAMESPACE} -o jsonpath='{.status.phase}'" "Succeeded"
     local rc=$?
     ${K} delete pod "${name}" -n "${NAMESPACE}" --wait=true 2>/dev/null || true
@@ -261,13 +268,16 @@ bind_pvc e2e-expand-pvc "PVC created at 100Mi"
 ${K} patch pvc e2e-expand-pvc -n "${NAMESPACE}" \
     -p '{"spec":{"resources":{"requests":{"storage":"500Mi"}}}}'
 
-if wait_until 60 "${K} get pvc e2e-expand-pvc -n ${NAMESPACE} -o jsonpath='{.status.capacity.storage}'" "500Mi"; then
+# Node-only expansion is completed by kubelet when the volume is mounted.
+start_pod e2e-expand-consumer e2e-expand-pvc "sleep 300"
+
+if wait_until 180 "${K} get pvc e2e-expand-pvc -n ${NAMESPACE} -o jsonpath='{.status.capacity.storage}'" "500Mi"; then
     pass "PVC expanded to 500Mi"
 else
     fail "PVC did not expand to 500Mi"
 fi
 
-delete_resources pvc/e2e-expand-pvc
+delete_resources pod/e2e-expand-consumer pvc/e2e-expand-pvc
 
 # ─── Quota enforcement ───────────────────────────────────────────────────────
 

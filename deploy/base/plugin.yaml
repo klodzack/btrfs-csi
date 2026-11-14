@@ -145,11 +145,17 @@ spec:
           args:
             - --csi-address=/csi/csi.sock
             - --extra-create-metadata
-            - --leader-election
+            - --node-deployment
+            - --strict-topology
+            - --feature-gates=Topology=true
             - --timeout=120s
             - --enable-capacity
             - --capacity-ownerref-level=1
           env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
             - name: NAMESPACE
               valueFrom:
                 fieldRef:
