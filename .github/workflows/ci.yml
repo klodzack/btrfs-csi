@@ -6,7 +6,7 @@ on:
     tags: ['v*', 'stable']
 
 env:
-  IMAGE_NAME: ghcr.io/mporrato/btrfs-csi-driver
+  IMAGE_NAME: ghcr.io/klodzack/btrfs-csi-driver
 
 permissions:
   contents: read
