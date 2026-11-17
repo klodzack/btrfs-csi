@@ -3,9 +3,12 @@
 package btrfs
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/google/uuid"
 )
 
 func TestRootSettingsInheritanceAndIsolation(t *testing.T) {
@@ -109,5 +112,64 @@ func TestNocowTransitionsFromDisabledCompression(t *testing.T) {
 			t.Fatal(err)
 		}
 		assertRootSettings(t, m, path, settings)
+	}
+}
+
+func TestCrossFilesystemSnapshotPreservesRootSettings(t *testing.T) {
+	sourcePool := setupLoopbackBtrfs(t)
+	targetPool := setupLoopbackBtrfs(t)
+	for _, tc := range []struct {
+		name   string
+		source RootSettings
+		target RootSettings
+	}{
+		{"inherit-to-zstd", RootSettings{Compression: "inherit"}, RootSettings{Compression: "zstd"}},
+		{"nocow-to-zstd", RootSettings{Nodatacow: true, Compression: "none"}, RootSettings{Compression: "zstd"}},
+		{"none-to-zstd", RootSettings{Compression: "none"}, RootSettings{Compression: "zstd"}},
+		{"zstd-to-lzo", RootSettings{Compression: "zstd"}, RootSettings{Compression: "lzo"}},
+	} {
+		for _, readonly := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/readonly=%v", tc.name, readonly), func(t *testing.T) {
+				checkReceivedRootSettings(t, sourcePool, targetPool, tc.source, tc.target, readonly)
+			})
+		}
+	}
+}
+
+func checkReceivedRootSettings(t *testing.T, sourcePool, targetPool string,
+	sourceSettings, targetSettings RootSettings, readonly bool) {
+	t.Helper()
+	m := &RealManager{}
+	if err := m.ApplyRootSettings(t.Context(), targetPool, targetSettings); err != nil {
+		t.Fatal(err)
+	}
+	name := uuid.NewString()
+	source := filepath.Join(sourcePool, name)
+	target := filepath.Join(targetPool, name)
+	if err := m.CreateSubvolume(t.Context(), source, CreateSubvolumeOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ApplyRootSettings(t.Context(), source, sourceSettings); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "data"), []byte("source data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.CreateSnapshot(t.Context(), source, target, readonly); err != nil {
+		t.Fatal(err)
+	}
+	assertRootSettings(t, m, target, sourceSettings)
+	assertRootSettings(t, m, source, sourceSettings)
+	assertRootSettings(t, m, targetPool, targetSettings)
+	data, err := os.ReadFile(filepath.Join(target, "data"))
+	if err != nil || string(data) != "source data" {
+		t.Fatalf("received data = %q, %v", data, err)
+	}
+	err = os.WriteFile(filepath.Join(target, "new-data"), []byte("new data"), 0o600)
+	if readonly && err == nil {
+		t.Fatal("received snapshot is not readonly")
+	}
+	if !readonly && err != nil {
+		t.Fatalf("received clone is not writable: %v", err)
 	}
 }
