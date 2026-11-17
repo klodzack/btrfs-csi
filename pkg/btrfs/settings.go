@@ -64,8 +64,7 @@ func (m *RealManager) ApplyRootSettings(ctx context.Context, path string, settin
 	if err != nil {
 		return err
 	}
-	setCompression := func() error {
-		value := settings.Compression
+	setCompression := func(value string) error {
 		if value == "inherit" {
 			value = ""
 		}
@@ -74,9 +73,9 @@ func (m *RealManager) ApplyRootSettings(ctx context.Context, path string, settin
 		}
 		return nil
 	}
-	// Compression and NOCOW are mutually exclusive: clear the old mode first.
-	if settings.Nodatacow && current.Compression != "none" {
-		if err := setCompression(); err != nil {
+	// NOCOW conflicts with both COMPRESS and NOCOMPRESS: remove the property, not just the algorithm.
+	if settings.Nodatacow && !current.Nodatacow && current.Compression != "inherit" {
+		if err := setCompression("inherit"); err != nil {
 			return err
 		}
 	}
@@ -90,7 +89,7 @@ func (m *RealManager) ApplyRootSettings(ctx context.Context, path string, settin
 		}
 	}
 	if !settings.Nodatacow && (current.Compression != settings.Compression || current.Nodatacow) {
-		return setCompression()
+		return setCompression(settings.Compression)
 	}
 	return nil
 }

@@ -92,3 +92,22 @@ func TestNocowSubvolumeUnderCompressedParent(t *testing.T) {
 		t.Fatalf("NOCOW subvolume settings = %+v, %v", got, err)
 	}
 }
+
+func TestNocowTransitionsFromDisabledCompression(t *testing.T) {
+	mnt := setupLoopbackBtrfs(t)
+	m := &RealManager{}
+	path := filepath.Join(mnt, "volume")
+	if err := m.CreateSubvolume(t.Context(), path, CreateSubvolumeOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, settings := range []RootSettings{
+		{Compression: "none"},
+		{Nodatacow: true, Compression: "none"},
+		{Compression: "none"},
+	} {
+		if err := m.ApplyRootSettings(t.Context(), path, settings); err != nil {
+			t.Fatal(err)
+		}
+		assertRootSettings(t, m, path, settings)
+	}
+}

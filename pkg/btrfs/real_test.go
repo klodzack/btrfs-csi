@@ -340,8 +340,8 @@ func TestRealManagerCreateSubvolume_WithNodatacow(t *testing.T) {
 		t.Fatalf("CreateSubvolume: %v", err)
 	}
 
-	if len(calls) != 5 {
-		t.Fatalf("expected 5 commands, got %d: %v", len(calls), calls)
+	if len(calls) != 4 {
+		t.Fatalf("expected 4 commands, got %d: %v", len(calls), calls)
 	}
 
 	// First command: btrfs subvolume create <path> (without --nodatacow)
@@ -355,11 +355,8 @@ func TestRealManagerCreateSubvolume_WithNodatacow(t *testing.T) {
 		t.Errorf("unexpected --nodatacow in first command args: %v", calls[0].args)
 	}
 
-	if !slices.Equal(calls[3].args, []string{"property", "set", "/test/path", "compression", "none"}) {
-		t.Errorf("compression must be disabled before NOCOW: %v", calls[3])
-	}
-	if calls[4].name != "chattr" || !slices.Equal(calls[4].args, []string{"+C", "/test/path"}) {
-		t.Errorf("expected final command chattr +C /test/path, got %v", calls[4])
+	if calls[3].name != "chattr" || !slices.Equal(calls[3].args, []string{"+C", "/test/path"}) {
+		t.Errorf("expected final command chattr +C /test/path, got %v", calls[3])
 	}
 }
 

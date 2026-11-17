@@ -3,6 +3,7 @@ package btrfs
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -46,7 +47,11 @@ func TestApplyRootSettings(t *testing.T) {
 		want                  [][]string
 	}{
 		{"disable cow", "--------c-------------", "compression=zstd", RootSettings{true, "none"}, [][]string{
-			{"btrfs", "property", "set", "/pool/vol", "compression", "none"},
+			{"btrfs", "property", "set", "/pool/vol", "compression", ""},
+			{"chattr", "+C", "/pool/vol"},
+		}},
+		{"disable cow from compression none", "---------------------m", "compression=", RootSettings{true, "none"}, [][]string{
+			{"btrfs", "property", "set", "/pool/vol", "compression", ""},
 			{"chattr", "+C", "/pool/vol"},
 		}},
 		{"enable compression", "---------------C------", "compression=", RootSettings{false, "zstd"}, [][]string{
@@ -131,7 +136,7 @@ func TestCreateSubvolumeNocowClearsInheritedCompression(t *testing.T) {
 			if args[0] == "property" && args[1] == "get" {
 				return "compression=zstd", nil
 			}
-			if args[0] == "property" && args[1] == "set" && args[len(args)-1] == "none" {
+			if args[0] == "property" && args[1] == "set" && args[len(args)-1] == "" {
 				compressionDisabled = true
 			}
 		}
@@ -140,6 +145,80 @@ func TestCreateSubvolumeNocowClearsInheritedCompression(t *testing.T) {
 	if err := (&RealManager{}).CreateSubvolume(t.Context(), "/pool/vol", CreateSubvolumeOptions{Nodatacow: true}); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestApplyRootSettingsKernelFlagConstraints(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		nocow       bool
+		compression string
+		want        RootSettings
+	}{
+		{"compression to nocow", false, "zstd", RootSettings{true, "none"}},
+		{"nocompress to nocow", false, "none", RootSettings{true, "none"}},
+		{"inherit to nocow", false, "inherit", RootSettings{true, "none"}},
+		{"nocow to compression", true, "inherit", RootSettings{false, "zstd"}},
+		{"nocow to nocompress", true, "inherit", RootSettings{false, "none"}},
+		{"nocow to inherit", true, "inherit", RootSettings{false, "inherit"}},
+		{"nocow unchanged", true, "inherit", RootSettings{true, "none"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			saved := runCommand
+			t.Cleanup(func() { runCommand = saved })
+			flags := &kernelRootFlags{nocow: tc.nocow, compression: tc.compression}
+			runCommand = flags.run
+			m := &RealManager{}
+			if err := m.ApplyRootSettings(t.Context(), "/pool/vol", tc.want); err != nil {
+				t.Fatal(err)
+			}
+			got, err := m.GetRootSettings(t.Context(), "/pool/vol")
+			if err != nil || got != tc.want {
+				t.Fatalf("root settings = %+v, %v; want %+v", got, err, tc.want)
+			}
+		})
+	}
+}
+
+type kernelRootFlags struct {
+	nocow       bool
+	compression string
+}
+
+func (k *kernelRootFlags) run(_ context.Context, name string, args ...string) (string, error) {
+	switch name {
+	case "lsattr":
+		flags := "----------------------"
+		if k.nocow {
+			flags += "C"
+		}
+		if k.compression == "none" {
+			flags += "m"
+		}
+		return flags + " /pool/vol", nil
+	case "btrfs":
+		if args[1] == "get" {
+			if k.compression == "inherit" {
+				return "compression=", nil
+			}
+			return "compression=" + k.compression, nil
+		}
+		value := args[len(args)-1]
+		if k.nocow && value != "" {
+			return "", errors.New("compression conflicts with NOCOW")
+		}
+		k.compression = value
+		if k.compression == "" {
+			k.compression = "inherit"
+		}
+	case "chattr":
+		if k.compression != "inherit" {
+			return "", errors.New("NOCOW conflicts with COMPRESS or NOCOMPRESS")
+		}
+		k.nocow = args[0] == "+C"
+	default:
+		return "", fmt.Errorf("unexpected command %s %q", name, args)
+	}
+	return "", nil
 }
 
 func TestCreateSubvolumeNocowFailureCleansUp(t *testing.T) {
