@@ -12,6 +12,8 @@ func TestManagerInterface(t *testing.T) {
 
 	// Expected methods
 	expectedMethods := []string{
+		"GetRootSettings",
+		"ApplyRootSettings",
 		"CreateSubvolume",
 		"DeleteSubvolume",
 		"SubvolumeExists",

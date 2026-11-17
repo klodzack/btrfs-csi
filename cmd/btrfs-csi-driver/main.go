@@ -47,6 +47,7 @@ func runWithContext(ctx context.Context, args []string, mgr btrfs.Manager) error
 		poolsDir   = fs.String("pools-dir", "/var/lib/btrfs-csi", "Base directory containing pool subdirectories")
 		kubeletDir = fs.String("kubelet-dir", "/var/lib/kubelet", "Kubelet base directory for target path validation")
 		version    = fs.Bool("version", false, "Print version and exit")
+		pvcOptions = fs.String("pvc-options", "auto", "PVC options integration: auto, enabled, or disabled")
 	)
 
 	if err := fs.Parse(args); err != nil {
@@ -56,6 +57,10 @@ func runWithContext(ctx context.Context, args []string, mgr btrfs.Manager) error
 	if *version {
 		fmt.Println("btrfs-csi-driver version " + driver.Version)
 		return nil
+	}
+	pvcClient, err := driver.NewInClusterPVCClient(*pvcOptions)
+	if err != nil {
+		return fmt.Errorf("configure PVC options: %w", err)
 	}
 
 	if *nodeID == "" {
@@ -85,6 +90,7 @@ func runWithContext(ctx context.Context, args []string, mgr btrfs.Manager) error
 		return err
 	}
 	drv.SetPools(pools)
+	drv.SetPVCClient(pvcClient)
 	if err := drv.SetKubeletPath(*kubeletDir); err != nil {
 		return fmt.Errorf("set kubelet path: %w", err)
 	}
@@ -102,6 +108,17 @@ func runWithContext(ctx context.Context, args []string, mgr btrfs.Manager) error
 		},
 	)
 	defer close(configStop)
+
+	optionsCtx, cancelOptions := context.WithCancel(ctx)
+	optionsDone := make(chan struct{})
+	go func() {
+		defer close(optionsDone)
+		drv.RunPVCOptions(optionsCtx, 30*time.Second)
+	}()
+	defer func() {
+		cancelOptions()
+		<-optionsDone
+	}()
 
 	// Start driver in a goroutine
 	errCh := make(chan error, 1)

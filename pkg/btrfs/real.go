@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/google/uuid"
 	"k8s.io/klog/v2"
@@ -40,7 +41,12 @@ func (m *RealManager) CreateSubvolume(ctx context.Context, path string, opts Cre
 		return fmt.Errorf("create subvolume %s: %w", path, err)
 	}
 	if opts.Nodatacow {
-		if _, err := runCommand(ctx, "chattr", "+C", path); err != nil {
+		if err := m.ApplyRootSettings(ctx, path, RootSettings{Nodatacow: true, Compression: "none"}); err != nil {
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+			defer cancel()
+			if cleanupErr := m.DeleteSubvolume(cleanupCtx, path); cleanupErr != nil {
+				klog.ErrorS(cleanupErr, "Clean up subvolume after NOCOW failure", "path", path)
+			}
 			return fmt.Errorf("disable cow on subvolume %s: %w", path, err)
 		}
 	}
@@ -172,11 +178,13 @@ func (m *RealManager) doSendReceive(ctx context.Context, tempSnap, dstDir, dst s
 		}
 	}
 
-	// Make writable if needed
-	if !readonly {
-		if _, err := runCommand(ctx, "btrfs", "property", "set", "-f", dst, "ro", "false"); err != nil {
-			return fmt.Errorf("make writable %s: %w", dst, err)
+	if err := m.finalizeReceivedRoot(ctx, tempSnap, dst, readonly); err != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		if cleanupErr := m.DeleteSubvolume(cleanupCtx, dst); cleanupErr != nil {
+			klog.ErrorS(cleanupErr, "Clean up received subvolume after normalization failure", "path", dst)
 		}
+		return err
 	}
 	return nil
 }

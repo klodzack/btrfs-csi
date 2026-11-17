@@ -31,6 +31,12 @@ type FsUsage struct {
 // Manager abstracts all btrfs CLI operations.
 // Implementations must be safe for concurrent use.
 type Manager interface {
+	// GetRootSettings inspects attributes of the subvolume root, not its children.
+	GetRootSettings(ctx context.Context, path string) (RootSettings, error)
+
+	// ApplyRootSettings changes only root defaults; existing children are untouched.
+	ApplyRootSettings(ctx context.Context, path string, settings RootSettings) error
+
 	// CreateSubvolume creates a new btrfs subvolume at the specified path.
 	// opts controls optional behavior such as nodatacow.
 	CreateSubvolume(ctx context.Context, path string, opts CreateSubvolumeOptions) error
@@ -42,7 +48,8 @@ type Manager interface {
 	SubvolumeExists(ctx context.Context, path string) (bool, error)
 
 	// CreateSnapshot creates a snapshot of src at dst.
-	// If readonly is true, the snapshot will be read-only.
+	// Source root defaults are preserved, including across filesystems.
+	// If readonly is true, the snapshot will be read-only when this returns.
 	CreateSnapshot(ctx context.Context, src, dst string, readonly bool) error
 
 	// EnsureQuotaEnabled enables quotas on the filesystem at the specified mountpoint.

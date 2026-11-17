@@ -36,6 +36,7 @@ func (s *memStore) GetVolume(id string) (*state.Volume, bool) {
 		return nil, false
 	}
 	cp := *v
+	cp.Options = cloneTestOptions(v.Options)
 	cp.BasePath = s.dir
 	return &cp, true
 }
@@ -46,6 +47,7 @@ func (s *memStore) GetVolumeByName(name string) (*state.Volume, bool) {
 	for _, v := range s.volumes {
 		if v.Name == name {
 			cp := *v
+			cp.Options = cloneTestOptions(v.Options)
 			cp.BasePath = s.dir
 			return &cp, true
 		}
@@ -59,6 +61,7 @@ func (s *memStore) ListVolumes() []*state.Volume {
 	out := make([]*state.Volume, 0, len(s.volumes))
 	for _, v := range s.volumes {
 		cp := *v
+		cp.Options = cloneTestOptions(v.Options)
 		cp.BasePath = s.dir
 		out = append(out, &cp)
 	}
@@ -69,8 +72,21 @@ func (s *memStore) SaveVolume(volume *state.Volume) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cp := *volume
+	cp.Options = cloneTestOptions(volume.Options)
 	s.volumes[volume.ID] = &cp
 	return nil
+}
+
+func cloneTestOptions(opts *state.VolumeOptions) *state.VolumeOptions {
+	if opts == nil {
+		return nil
+	}
+	cp := *opts
+	if opts.Pending != nil {
+		pending := *opts.Pending
+		cp.Pending = &pending
+	}
+	return &cp
 }
 
 func (s *memStore) DeleteVolume(id string) error {

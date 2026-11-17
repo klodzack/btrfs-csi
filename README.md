@@ -166,6 +166,69 @@ parameters:
 - `cow: "true"` (default): Web servers, log aggregation, general applications—benefits from CoW efficiency
 - `cow: "false"`: PostgreSQL, MySQL, Elasticsearch, VMs—workloads that do their own caching and suffer from CoW write amplification
 
+### Compression and Per-PVC Overrides
+
+StorageClasses can also set `compression: "zstd"`, `"zlib"`, `"lzo"`, `"none"`,
+or `"inherit"` (the default). Compression levels such as `zstd:5` are rejected:
+btrfs does not support persistent per-directory compression levels.
+
+PVC annotations override the StorageClass:
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: compressed-data
+  annotations:
+    btrfs.csi.local/cow: "true"
+    btrfs.csi.local/compression: "zstd"
+spec:
+  storageClassName: btrfs
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 10Gi
+```
+
+Both annotations may be edited after binding. The owning node reconciles changes
+at startup and every 30 seconds. Removing an annotation uses the **current**
+StorageClass default, so deleting and recreating a StorageClass with changed
+parameters also updates its existing PVCs. Invalid updates retain the last valid
+settings and produce a `VolumeOptionsUpdateFailed` warning Event; API failures or
+missing StorageClasses never reset settings.
+
+Changes affect **only the subvolume root's defaults**, not existing files or
+subdirectories. New children inherit their parent directory's settings; files
+created inside an existing subdirectory continue to inherit that subdirectory's
+old settings. No recursive attribute changes, data rewriting, or pool remounts
+are performed. `inherit` clears the root's explicit compression property and
+compression flags, including legacy flag-only compression;
+`none` explicitly prohibits compression.
+
+Effective `cow: "false"` disables compression inherited from the StorageClass.
+It also disables checksumming for affected new files. An explicit PVC request
+for enabled compression while COW is disabled is rejected; enable COW explicitly
+when overriding a NOCOW class with compression.
+
+Clones and restores retain the source root's COW/compression defaults at creation,
+even if the destination class or annotations differ. A subsequent settings edit
+applies the destination defaults to the root, without converting inherited data.
+Cross-pool transfers explicitly normalize the received root before publication.
+This does not recursively restore per-file inode flags omitted by btrfs receive
+or rewrite received file data.
+Existing volumes are safely adopted through their bound PV and PVC UID: their
+root settings are preserved unless explicit annotations request a change.
+Same-name replacement claims cannot change retained volumes.
+
+PVC integration uses in-cluster credentials. `--pvc-options=auto` enables it in
+Kubernetes and leaves standalone CSI usage StorageClass-only. Use `enabled` to
+require credentials or `disabled` to opt out. The shipped RBAC already permits
+the required PVC, PV, StorageClass, and Event operations.
+
+Autodefrag, independent nodatasum, and RAID profiles are filesystem-wide rather
+than per-subvolume settings and are not exposed here. Deduplication requires an
+external out-of-band scanning tool; there is no native per-subvolume dedupe mode.
+
 ### Multi-Node Clusters
 
 Prepare btrfs pools under `/var/lib/btrfs-csi/<pool-name>` on each storage node, then use the normal deployment overlays. Pool paths and names are local to each node; use the same pool name on nodes that should serve the same StorageClass. Nodes without valid pools cannot provision volumes. Keep `--nodeid` set to the Kubernetes node name, as the DaemonSet does.
@@ -383,6 +446,7 @@ spec:
 |-----------|---------|-------------|
 | `pool` | (auto) | Pool name. Auto-selects the sole pool, or the pool named `default`. If multiple pools exist and none is named `default`, volume creation fails — explicitly specify the pool. |
 | `cow` | `"true"` | Set to `"false"` to disable copy-on-write (nodatacow). Use for databases and VMs. |
+| `compression` | `"inherit"` | Root compression default: `inherit`, `none`, `zstd`, `zlib`, or `lzo`. No per-subvolume levels. Suppressed by `cow: "false"`. |
 
 ## Deployment
 

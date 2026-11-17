@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,6 +16,19 @@ func TestRunVersionFlag(t *testing.T) {
 	err := run([]string{"--version"})
 	if err != nil {
 		t.Errorf("run with --version should not return error, got: %v", err)
+	}
+}
+
+func TestRunPVCOptionsFlag(t *testing.T) {
+	for _, mode := range []string{"invalid", "enabled"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Setenv("KUBERNETES_SERVICE_HOST", "")
+			t.Setenv("KUBERNETES_SERVICE_PORT", "")
+			err := runWithContext(t.Context(), []string{"--pvc-options=" + mode}, &btrfs.MockManager{})
+			if err == nil || !strings.Contains(err.Error(), "PVC options") {
+				t.Fatalf("expected PVC options configuration error, got %v", err)
+			}
+		})
 	}
 }
 
