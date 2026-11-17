@@ -12,6 +12,15 @@ type RootSettings struct {
 	Compression string
 }
 
+type rootInspection struct {
+	RootSettings
+	compressFlag bool
+}
+
+func (r rootInspection) compressionMatches(compression string) bool {
+	return r.Compression == compression && (compression != "inherit" || !r.compressFlag)
+}
+
 // Validate rejects settings which cannot be expressed per directory.
 func (s RootSettings) Validate() error {
 	switch s.Compression {
@@ -27,17 +36,22 @@ func (s RootSettings) Validate() error {
 
 // GetRootSettings implements Manager.
 func (m *RealManager) GetRootSettings(ctx context.Context, path string) (RootSettings, error) {
+	inspection, err := m.inspectRootSettings(ctx, path)
+	return inspection.RootSettings, err
+}
+
+func (m *RealManager) inspectRootSettings(ctx context.Context, path string) (rootInspection, error) {
 	attrs, err := runCommand(ctx, "lsattr", "-d", path)
 	if err != nil {
-		return RootSettings{}, fmt.Errorf("read root attributes %s: %w", path, err)
+		return rootInspection{}, fmt.Errorf("read root attributes %s: %w", path, err)
 	}
 	fields := strings.Fields(attrs)
 	if len(fields) < 2 {
-		return RootSettings{}, fmt.Errorf("read root attributes %s: malformed lsattr output", path)
+		return rootInspection{}, fmt.Errorf("read root attributes %s: malformed lsattr output", path)
 	}
 	property, err := runCommand(ctx, "btrfs", "property", "get", path, "compression")
 	if err != nil {
-		return RootSettings{}, fmt.Errorf("read root compression %s: %w", path, err)
+		return rootInspection{}, fmt.Errorf("read root compression %s: %w", path, err)
 	}
 	settings := RootSettings{
 		Nodatacow:   strings.Contains(fields[0], "C"),
@@ -50,9 +64,9 @@ func (m *RealManager) GetRootSettings(ctx context.Context, path string) (RootSet
 		settings.Compression = "none"
 	}
 	if err := settings.Validate(); err != nil {
-		return RootSettings{}, fmt.Errorf("read root settings %s: %w", path, err)
+		return rootInspection{}, fmt.Errorf("read root settings %s: %w", path, err)
 	}
-	return settings, nil
+	return rootInspection{RootSettings: settings, compressFlag: strings.Contains(fields[0], "c")}, nil
 }
 
 // ApplyRootSettings implements Manager.
@@ -60,7 +74,7 @@ func (m *RealManager) ApplyRootSettings(ctx context.Context, path string, settin
 	if err := settings.Validate(); err != nil {
 		return err
 	}
-	current, err := m.GetRootSettings(ctx, path)
+	current, err := m.inspectRootSettings(ctx, path)
 	if err != nil {
 		return err
 	}
@@ -74,7 +88,7 @@ func (m *RealManager) ApplyRootSettings(ctx context.Context, path string, settin
 		return nil
 	}
 	// NOCOW conflicts with both COMPRESS and NOCOMPRESS: remove the property, not just the algorithm.
-	if settings.Nodatacow && !current.Nodatacow && current.Compression != "inherit" {
+	if settings.Nodatacow && !current.Nodatacow && !current.compressionMatches("inherit") {
 		if err := setCompression("inherit"); err != nil {
 			return err
 		}
@@ -88,7 +102,7 @@ func (m *RealManager) ApplyRootSettings(ctx context.Context, path string, settin
 			return fmt.Errorf("set root cow %s: %w", path, err)
 		}
 	}
-	if !settings.Nodatacow && (current.Compression != settings.Compression || current.Nodatacow) {
+	if !settings.Nodatacow && (!current.compressionMatches(settings.Compression) || current.Nodatacow) {
 		return setCompression(settings.Compression)
 	}
 	return nil

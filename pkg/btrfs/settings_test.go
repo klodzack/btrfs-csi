@@ -54,6 +54,10 @@ func TestApplyRootSettings(t *testing.T) {
 			{"btrfs", "property", "set", "/pool/vol", "compression", ""},
 			{"chattr", "+C", "/pool/vol"},
 		}},
+		{"disable cow from flag-only compression", "--------c-------------", "compression=", RootSettings{true, "none"}, [][]string{
+			{"btrfs", "property", "set", "/pool/vol", "compression", ""},
+			{"chattr", "+C", "/pool/vol"},
+		}},
 		{"enable compression", "---------------C------", "compression=", RootSettings{false, "zstd"}, [][]string{
 			{"chattr", "-C", "/pool/vol"},
 			{"btrfs", "property", "set", "/pool/vol", "compression", "zstd"},
@@ -63,6 +67,9 @@ func TestApplyRootSettings(t *testing.T) {
 			{"btrfs", "property", "set", "/pool/vol", "compression", "none"},
 		}},
 		{"inherit", "--------c-------------", "compression=zlib", RootSettings{false, "inherit"}, [][]string{
+			{"btrfs", "property", "set", "/pool/vol", "compression", ""},
+		}},
+		{"inherit from flag-only compression", "--------c-------------", "compression=", RootSettings{false, "inherit"}, [][]string{
 			{"btrfs", "property", "set", "/pool/vol", "compression", ""},
 		}},
 		{"idempotent", "--------c-------------", "compression=lzo", RootSettings{false, "lzo"}, nil},
@@ -182,19 +189,13 @@ func TestApplyRootSettingsKernelFlagConstraints(t *testing.T) {
 type kernelRootFlags struct {
 	nocow       bool
 	compression string
+	flagOnly    bool
 }
 
 func (k *kernelRootFlags) run(_ context.Context, name string, args ...string) (string, error) {
 	switch name {
 	case "lsattr":
-		flags := "----------------------"
-		if k.nocow {
-			flags += "C"
-		}
-		if k.compression == "none" {
-			flags += "m"
-		}
-		return flags + " /pool/vol", nil
+		return k.attributes() + " /pool/vol", nil
 	case "btrfs":
 		if args[1] == "get" {
 			if k.compression == "inherit" {
@@ -207,11 +208,12 @@ func (k *kernelRootFlags) run(_ context.Context, name string, args ...string) (s
 			return "", errors.New("compression conflicts with NOCOW")
 		}
 		k.compression = value
+		k.flagOnly = false
 		if k.compression == "" {
 			k.compression = "inherit"
 		}
 	case "chattr":
-		if k.compression != "inherit" {
+		if k.compression != "inherit" || k.flagOnly {
 			return "", errors.New("NOCOW conflicts with COMPRESS or NOCOMPRESS")
 		}
 		k.nocow = args[0] == "+C"
@@ -219,6 +221,45 @@ func (k *kernelRootFlags) run(_ context.Context, name string, args ...string) (s
 		return "", fmt.Errorf("unexpected command %s %q", name, args)
 	}
 	return "", nil
+}
+
+func (k *kernelRootFlags) attributes() string {
+	flags := "----------------------"
+	if k.nocow {
+		flags += "C"
+	}
+	if k.compression == "none" {
+		flags += "m"
+	}
+	if k.flagOnly || (k.compression != "inherit" && k.compression != "none") {
+		flags += "c"
+	}
+	return flags
+}
+
+func TestFlagOnlyCompressionTransitions(t *testing.T) {
+	for _, desired := range []RootSettings{
+		{Compression: "inherit"},
+		{Nodatacow: true, Compression: "none"},
+	} {
+		t.Run(fmt.Sprintf("%+v", desired), func(t *testing.T) {
+			saved := runCommand
+			t.Cleanup(func() { runCommand = saved })
+			flags := &kernelRootFlags{compression: "inherit", flagOnly: true}
+			runCommand = flags.run
+			m := &RealManager{}
+			if err := m.ApplyRootSettings(t.Context(), "/pool/vol", desired); err != nil {
+				t.Fatal(err)
+			}
+			if flags.flagOnly {
+				t.Fatal("legacy COMPRESS flag was not cleared")
+			}
+			got, err := m.GetRootSettings(t.Context(), "/pool/vol")
+			if err != nil || got != desired {
+				t.Fatalf("root settings = %+v, %v; want %+v", got, err, desired)
+			}
+		})
+	}
 }
 
 func TestCreateSubvolumeNocowFailureCleansUp(t *testing.T) {

@@ -201,7 +201,8 @@ Changes affect **only the subvolume root's defaults**, not existing files or
 subdirectories. New children inherit their parent directory's settings; files
 created inside an existing subdirectory continue to inherit that subdirectory's
 old settings. No recursive attribute changes, data rewriting, or pool remounts
-are performed. `inherit` clears the root's explicit compression property;
+are performed. `inherit` clears the root's explicit compression property and
+compression flags, including legacy flag-only compression;
 `none` explicitly prohibits compression.
 
 Effective `cow: "false"` disables compression inherited from the StorageClass.
@@ -209,9 +210,12 @@ It also disables checksumming for affected new files. An explicit PVC request
 for enabled compression while COW is disabled is rejected; enable COW explicitly
 when overriding a NOCOW class with compression.
 
-Clones and restores retain the source's COW/compression defaults at creation,
+Clones and restores retain the source root's COW/compression defaults at creation,
 even if the destination class or annotations differ. A subsequent settings edit
 applies the destination defaults to the root, without converting inherited data.
+Cross-pool transfers explicitly normalize the received root before publication.
+This does not recursively restore per-file inode flags omitted by btrfs receive
+or rewrite received file data.
 Existing volumes are safely adopted through their bound PV and PVC UID: their
 root settings are preserved unless explicit annotations request a change.
 Same-name replacement claims cannot change retained volumes.

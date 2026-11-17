@@ -178,11 +178,13 @@ func (m *RealManager) doSendReceive(ctx context.Context, tempSnap, dstDir, dst s
 		}
 	}
 
-	// Make writable if needed
-	if !readonly {
-		if _, err := runCommand(ctx, "btrfs", "property", "set", "-f", dst, "ro", "false"); err != nil {
-			return fmt.Errorf("make writable %s: %w", dst, err)
+	if err := m.finalizeReceivedRoot(ctx, tempSnap, dst, readonly); err != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		if cleanupErr := m.DeleteSubvolume(cleanupCtx, dst); cleanupErr != nil {
+			klog.ErrorS(cleanupErr, "Clean up received subvolume after normalization failure", "path", dst)
 		}
+		return err
 	}
 	return nil
 }

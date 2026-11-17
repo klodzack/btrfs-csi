@@ -439,10 +439,8 @@ func (d *Driver) createVolumeLocked(ctx context.Context, req *csi.CreateVolumeRe
 		}
 	}()
 
-	if req.VolumeContentSource == nil {
-		if err := d.manager.ApplyRootSettings(ctx, vol.Path(), effective); err != nil {
-			return nil, status.Errorf(codes.Internal, "apply root settings: %v", err)
-		}
+	if err := d.manager.ApplyRootSettings(ctx, vol.Path(), effective); err != nil {
+		return nil, status.Errorf(codes.Internal, "apply root settings: %v", err)
 	}
 
 	if err := d.applyCapacityLimit(ctx, basePath, vol.Path(), capacityBytes); err != nil {
@@ -639,19 +637,14 @@ func (d *Driver) CreateSnapshot(ctx context.Context,
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "source volume %s not found", req.SourceVolumeId)
 	}
-	rootSettings, err := d.volumeRootSettings(ctx, srcVol)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "read snapshot source settings: %v", err)
-	}
 	id := uuid.New().String()
 	snap := &state.Snapshot{
-		ID:           id,
-		Name:         req.Name,
-		SourceVolID:  req.SourceVolumeId,
-		BasePath:     basePath,
-		CreatedAt:    time.Now(),
-		ReadyToUse:   true,
-		RootSettings: &rootSettings,
+		ID:          id,
+		Name:        req.Name,
+		SourceVolID: req.SourceVolumeId,
+		BasePath:    basePath,
+		CreatedAt:   time.Now(),
+		ReadyToUse:  true,
 	}
 
 	if err := os.MkdirAll(filepath.Dir(snap.Path()), 0o750); err != nil {
@@ -667,9 +660,7 @@ func (d *Driver) CreateSnapshot(ctx context.Context,
 		return nil, status.Errorf(codes.Internal, "create snapshot: %v", err)
 	}
 
-	d.populateSnapshotSize(ctx, snap)
-
-	// Clean up the on-disk snapshot if SaveSnapshot fails, to prevent orphaned subvolumes.
+	// Clean up the snapshot if inspection or state persistence fails.
 	cleanupNeeded := true
 	defer func() {
 		if cleanupNeeded {
@@ -681,6 +672,13 @@ func (d *Driver) CreateSnapshot(ctx context.Context,
 			}
 		}
 	}()
+
+	rootSettings, err := d.manager.GetRootSettings(ctx, snap.Path())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "read snapshot root settings: %v", err)
+	}
+	snap.RootSettings = &rootSettings
+	d.populateSnapshotSize(ctx, snap)
 
 	if err := d.store.SaveSnapshot(snap); err != nil {
 		return nil, status.Errorf(codes.Internal, "save snapshot state: %v", err)

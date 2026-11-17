@@ -130,6 +130,21 @@ func TestMockManagerCreateSnapshotError(t *testing.T) {
 	}
 }
 
+func TestMockManagerSnapshotPreservesRootSettings(t *testing.T) {
+	m := &MockManager{}
+	settings := RootSettings{Nodatacow: true, Compression: "none"}
+	if err := m.ApplyRootSettings(t.Context(), "/source", settings); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.CreateSnapshot(t.Context(), "/source", "/snapshot", true); err != nil {
+		t.Fatal(err)
+	}
+	got, err := m.GetRootSettings(t.Context(), "/snapshot")
+	if err != nil || got != settings {
+		t.Fatalf("snapshot root settings = %+v, %v; want %+v", got, err, settings)
+	}
+}
+
 func TestMockManagerEnsureQuotaEnabled(t *testing.T) {
 	m := &MockManager{}
 	if err := m.EnsureQuotaEnabled(context.Background(), "/mnt/btrfs"); err != nil {

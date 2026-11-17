@@ -3,9 +3,12 @@
 package btrfs
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/google/uuid"
@@ -172,4 +175,35 @@ func checkReceivedRootSettings(t *testing.T, sourcePool, targetPool string,
 	if !readonly && err != nil {
 		t.Fatalf("received clone is not writable: %v", err)
 	}
+}
+
+func TestCrossFilesystemSnapshotCleansUpOnSettingsFailure(t *testing.T) {
+	sourcePool := setupLoopbackBtrfs(t)
+	targetPool := setupLoopbackBtrfs(t)
+	m := &RealManager{}
+	if err := m.ApplyRootSettings(t.Context(), targetPool, RootSettings{Compression: "zstd"}); err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(sourcePool, "source")
+	target := filepath.Join(targetPool, "received")
+	if err := m.CreateSubvolume(t.Context(), source, CreateSubvolumeOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	saved := runCommand
+	t.Cleanup(func() { runCommand = saved })
+	expected := errors.New("cannot normalize received root")
+	runCommand = func(ctx context.Context, name string, args ...string) (string, error) {
+		if name == "btrfs" && slices.Equal(args, []string{"property", "set", target, "compression", ""}) {
+			return "", expected
+		}
+		return saved(ctx, name, args...)
+	}
+	if err := m.CreateSnapshot(t.Context(), source, target, true); !errors.Is(err, expected) {
+		t.Fatalf("expected normalization failure, got %v", err)
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("failed receive left a target subvolume: %v", err)
+	}
+	assertRootSettings(t, m, source, RootSettings{Compression: "inherit"})
+	assertRootSettings(t, m, targetPool, RootSettings{Compression: "zstd"})
 }

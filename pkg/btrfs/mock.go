@@ -139,6 +139,11 @@ func (m *MockManager) CreateSnapshot(ctx context.Context, src, dst string, reado
 		Dst:      dst,
 		Readonly: readonly,
 	})
+	if m.CreateSnapshotErr == nil {
+		if settings, ok := m.RootSettingsByPath[src]; ok {
+			m.RootSettingsByPath[dst] = settings
+		}
+	}
 	return m.CreateSnapshotErr
 }
 

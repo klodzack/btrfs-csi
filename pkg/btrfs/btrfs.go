@@ -48,7 +48,8 @@ type Manager interface {
 	SubvolumeExists(ctx context.Context, path string) (bool, error)
 
 	// CreateSnapshot creates a snapshot of src at dst.
-	// If readonly is true, the snapshot will be read-only.
+	// Source root defaults are preserved, including across filesystems.
+	// If readonly is true, the snapshot will be read-only when this returns.
 	CreateSnapshot(ctx context.Context, src, dst string, readonly bool) error
 
 	// EnsureQuotaEnabled enables quotas on the filesystem at the specified mountpoint.

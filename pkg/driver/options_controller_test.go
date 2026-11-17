@@ -1,14 +1,29 @@
 package driver
 
 import (
+	"context"
 	"errors"
 	"testing"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/mporrato/btrfs-csi/pkg/btrfs"
+	"github.com/mporrato/btrfs-csi/pkg/state"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+type receivedRootManager struct {
+	*btrfs.MockManager
+}
+
+func (m *receivedRootManager) CreateSnapshot(ctx context.Context, src, dst string, readonly bool) error {
+	if err := m.MockManager.CreateSnapshot(ctx, src, dst, readonly); err != nil {
+		return err
+	}
+	// Model a receive that retained the destination parent's compression and lost NOCOW.
+	m.RootSettingsByPath[dst] = btrfs.RootSettings{Compression: "zstd"}
+	return nil
+}
 
 func settingsRequest(name string, params map[string]string) *csi.CreateVolumeRequest {
 	return &csi.CreateVolumeRequest{Name: name, VolumeCapabilities: singleNodeWriterCap(), Parameters: params}
@@ -97,5 +112,100 @@ func TestCreateVolumeRejectsCompressionLevel(t *testing.T) {
 	}
 	if len(mock.CreateSubvolumeCalls) != 0 {
 		t.Fatal("invalid settings created a subvolume")
+	}
+}
+
+func TestCrossPoolVolumeRootSettingsMatchRecordedState(t *testing.T) {
+	for _, mode := range []string{"clone", "restore"} {
+		for _, cow := range []string{"true", "false"} {
+			t.Run(mode+"/cow="+cow, func(t *testing.T) {
+				d, mock, store := newTestDriverWithMock(t)
+				target := t.TempDir()
+				d.store.(*state.MultiStore).AddStoreForTest(target, newMemStore(target))
+				d.SetPools(map[string]string{"default": store.root(), "target": target})
+				source, err := d.CreateVolume(t.Context(), settingsRequest("source", map[string]string{"cow": cow}))
+				if err != nil {
+					t.Fatal(err)
+				}
+				original, _ := store.GetVolume(source.Volume.VolumeId)
+				content := &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Volume{
+					Volume: &csi.VolumeContentSource_VolumeSource{VolumeId: original.ID},
+				}}
+				if mode == "restore" {
+					snap, err := d.CreateSnapshot(t.Context(), &csi.CreateSnapshotRequest{Name: "snap", SourceVolumeId: original.ID})
+					if err != nil {
+						t.Fatal(err)
+					}
+					content.Type = &csi.VolumeContentSource_Snapshot{
+						Snapshot: &csi.VolumeContentSource_SnapshotSource{SnapshotId: snap.Snapshot.SnapshotId},
+					}
+				}
+				d.manager = &receivedRootManager{mock}
+				req := settingsRequest("received", map[string]string{"pool": "target"})
+				req.VolumeContentSource = content
+				resp, err := d.CreateVolume(t.Context(), req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				vol, _ := d.store.GetVolume(resp.Volume.VolumeId)
+				actual, err := d.manager.GetRootSettings(t.Context(), vol.Path())
+				if err != nil || actual != original.Options.Applied || vol.Options.Applied != actual || vol.Options.Creation != actual {
+					t.Fatalf("received root = %+v, %v; state = %+v; source = %+v", actual, err, vol.Options, original.Options.Applied)
+				}
+			})
+		}
+	}
+}
+
+func TestCloneRootSettingsFailureCleansUp(t *testing.T) {
+	d, mock, store := newTestDriverWithMock(t)
+	source, err := d.CreateVolume(t.Context(), settingsRequest("source", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mock.ApplyRootSettingsErr = errors.New("cannot apply received root settings")
+	req := settingsRequest("clone", nil)
+	req.VolumeContentSource = &csi.VolumeContentSource{Type: &csi.VolumeContentSource_Volume{
+		Volume: &csi.VolumeContentSource_VolumeSource{VolumeId: source.Volume.VolumeId},
+	}}
+	if _, err := d.CreateVolume(t.Context(), req); err == nil {
+		t.Fatal("failed root settings must prevent publishing the clone")
+	}
+	if len(store.ListVolumes()) != 1 || len(mock.DeleteSubvolumeCalls) != 1 {
+		t.Fatal("failed clone settings left state or a subvolume behind")
+	}
+}
+
+func TestSnapshotRecordsActualRootSettings(t *testing.T) {
+	d, mock, store := newTestDriverWithMock(t)
+	source, err := d.CreateVolume(t.Context(), settingsRequest("source", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.manager = &receivedRootManager{mock}
+	resp, err := d.CreateSnapshot(t.Context(), &csi.CreateSnapshotRequest{Name: "snap", SourceVolumeId: source.Volume.VolumeId})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap, _ := store.GetSnapshot(resp.Snapshot.SnapshotId)
+	actual, err := d.manager.GetRootSettings(t.Context(), snap.Path())
+	if err != nil || snap.RootSettings == nil || *snap.RootSettings != actual {
+		t.Fatalf("snapshot metadata = %+v; actual = %+v, %v", snap.RootSettings, actual, err)
+	}
+}
+
+func TestSnapshotRootInspectionFailureCleansUp(t *testing.T) {
+	d, mock, store := newTestDriverWithMock(t)
+	source, err := d.CreateVolume(t.Context(), settingsRequest("source", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mock.GetRootSettingsErr = errors.New("cannot inspect snapshot root")
+	_, err = d.CreateSnapshot(t.Context(), &csi.CreateSnapshotRequest{Name: "snap", SourceVolumeId: source.Volume.VolumeId})
+	if status.Code(err) != codes.Internal {
+		t.Fatalf("inspection failure must prevent saving the snapshot: %v", err)
+	}
+	if len(store.ListSnapshots()) != 0 || len(mock.DeleteSubvolumeCalls) != 1 {
+		t.Fatal("failed inspection left snapshot state or a subvolume behind")
 	}
 }
