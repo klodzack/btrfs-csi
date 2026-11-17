@@ -10,3 +10,4 @@ allowVolumeExpansion: true
 # parameters:
 #   pool: default  # optional; falls back to "default" or sole pool
 #   cow: "true"    # optional; set to "false" to disable copy-on-write (nodatacow)
+#   compression: "inherit"  # inherit, none, zstd, zlib, or lzo (no compression levels)

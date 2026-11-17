@@ -199,6 +199,7 @@ cleanup() {
     echo ""
     log "Cleaning up namespace ${NAMESPACE}..."
     ${K} delete namespace "${NAMESPACE}" --ignore-not-found --wait=true 2>/dev/null || true
+    ${K} delete storageclass -l "btrfs-csi-options-e2e=${NAMESPACE}" --ignore-not-found 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -483,6 +484,9 @@ else
     delete_resources pvc/e2e-cow-reverse-clone-pvc pvc/e2e-cow-reverse-source-pvc
     pass "Resources cleaned up"
 fi
+
+# shellcheck source=e2e-options.sh
+source "${SCRIPT_DIR}/e2e-options.sh"
 
 # ─── Summary ─────────────────────────────────────────────────────────────────
 

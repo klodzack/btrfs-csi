@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/mporrato/btrfs-csi/pkg/btrfs"
 )
 
 // Volume represents a btrfs subvolume used as a CSI volume.
@@ -27,6 +29,27 @@ type Volume struct {
 	SourceVolID string
 	// Nodatacow indicates whether copy-on-write is disabled for this volume.
 	Nodatacow bool
+	// Options is absent on legacy records until safely adopted.
+	Options *VolumeOptions `json:",omitempty"`
+}
+
+// PVCReference identifies a claim without allowing same-name replacements.
+type PVCReference struct {
+	Namespace string
+	Name      string
+	UID       string
+}
+
+// VolumeOptions separates immutable creation compatibility from live defaults.
+type VolumeOptions struct {
+	// Legacy marks adopted volumes whose original compression request was never recorded.
+	Legacy           bool `json:",omitempty"`
+	PVC              PVCReference
+	Request          btrfs.RootSettings
+	Creation         btrfs.RootSettings
+	Applied          btrfs.RootSettings
+	Pending          *btrfs.RootSettings `json:",omitempty"`
+	InputFingerprint string
 }
 
 // Path returns the absolute path to the btrfs subvolume for this volume.
@@ -51,6 +74,8 @@ type Snapshot struct {
 	SizeBytes int64
 	// ReadyToUse indicates whether the snapshot is ready to be used.
 	ReadyToUse bool
+	// RootSettings preserves defaults independently of the source's lifetime.
+	RootSettings *btrfs.RootSettings `json:",omitempty"`
 }
 
 // Path returns the absolute path to the btrfs snapshot for this snapshot.
@@ -118,6 +143,14 @@ func copyVolume(v *Volume) *Volume {
 		return nil
 	}
 	cp := *v
+	if v.Options != nil {
+		opts := *v.Options
+		if opts.Pending != nil {
+			pending := *opts.Pending
+			opts.Pending = &pending
+		}
+		cp.Options = &opts
+	}
 	return &cp
 }
 
@@ -127,6 +160,10 @@ func copySnapshot(s *Snapshot) *Snapshot {
 		return nil
 	}
 	cp := *s
+	if s.RootSettings != nil {
+		settings := *s.RootSettings
+		cp.RootSettings = &settings
+	}
 	return &cp
 }
 

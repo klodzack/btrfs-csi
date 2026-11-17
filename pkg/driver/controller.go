@@ -296,7 +296,8 @@ func parseCowParameter(params map[string]string) (bool, error) {
 // checkExistingVolume returns an idempotent response if a volume with the same
 // name already exists and is compatible. Returns (nil, nil) when no existing
 // volume is found, allowing the caller to proceed with creation.
-func (d *Driver) checkExistingVolume(req *csi.CreateVolumeRequest, nodatacow bool) (*csi.CreateVolumeResponse, error) {
+func (d *Driver) checkExistingVolume(req *csi.CreateVolumeRequest,
+	requested btrfs.RootSettings) (*csi.CreateVolumeResponse, error) {
 	existing, ok := d.store.GetVolumeByName(req.Name)
 	if !ok {
 		return nil, nil
@@ -309,13 +310,26 @@ func (d *Driver) checkExistingVolume(req *csi.CreateVolumeRequest, nodatacow boo
 			"volume %q already exists with capacity %d, incompatible with requested range",
 			req.Name, existing.CapacityBytes)
 	}
-	if existing.Nodatacow != nodatacow {
+	if existing.Options != nil {
+		if !creationSettingsCompatible(existing, req, requested) {
+			return nil, status.Errorf(codes.AlreadyExists, "volume %q exists with different creation defaults", req.Name)
+		}
+	} else if existing.Nodatacow != d.effectiveNodatacow(requested.Nodatacow, req.VolumeContentSource) {
 		return nil, status.Errorf(codes.AlreadyExists,
 			"volume %q already exists with cow=%v, incompatible with requested cow=%v",
-			req.Name, !existing.Nodatacow, !nodatacow)
+			req.Name, !existing.Nodatacow, !requested.Nodatacow)
 	}
 	klog.V(4).InfoS("CreateVolume idempotent", "name", req.Name, "volumeID", existing.ID)
 	return &csi.CreateVolumeResponse{Volume: toCSIVolume(existing, d.nodeID)}, nil
+}
+
+func creationSettingsCompatible(existing *state.Volume, req *csi.CreateVolumeRequest,
+	requested btrfs.RootSettings) bool {
+	if !existing.Options.Legacy {
+		return existing.Options.Request == requested
+	}
+	// The old driver recorded only effective COW; clone requests always inherited their source.
+	return req.VolumeContentSource != nil || existing.Options.Request.Nodatacow == requested.Nodatacow
 }
 
 // effectiveNodatacow computes the effective nodatacow value for idempotency
@@ -339,24 +353,6 @@ func (d *Driver) effectiveNodatacow(nodatacow bool, src *csi.VolumeContentSource
 	return effective
 }
 
-// inheritNodatacowFromSource overrides the volume's Nodatacow field to match
-// the source volume when cloning from a volume or snapshot. btrfs snapshots
-// always inherit the source's nodatacow property, so the on-disk reality must
-// match the stored state.
-func (d *Driver) inheritNodatacowFromSource(vol *state.Volume, sourceVolID, sourceSnapID string) {
-	if sourceVolID != "" {
-		if srcVol, ok := d.store.GetVolume(sourceVolID); ok {
-			vol.Nodatacow = srcVol.Nodatacow
-		}
-	} else if sourceSnapID != "" {
-		if snap, ok := d.store.GetSnapshot(sourceSnapID); ok {
-			if srcVol, ok := d.store.GetVolume(snap.SourceVolID); ok {
-				vol.Nodatacow = srcVol.Nodatacow
-			}
-		}
-	}
-}
-
 func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, status.FromContextError(err).Err()
@@ -365,22 +361,33 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		return nil, err
 	}
 
-	d.controllerMu.Lock()
-	defer d.controllerMu.Unlock()
-
-	nodatacow, err := parseCowParameter(req.Parameters)
+	requested, err := resolveRootSettings(req.Parameters, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	// Compute effective nodatacow for idempotency: clones inherit from source.
-	effectiveNodatacow := d.effectiveNodatacow(nodatacow, req.VolumeContentSource)
-
-	// Idempotency: return existing volume if one with the same name exists.
-	if resp, err := d.checkExistingVolume(req, effectiveNodatacow); resp != nil || err != nil {
-		return resp, err
+	// Retries must work during API outages and must not reapply mutable annotations.
+	d.controllerMu.Lock()
+	resp, existingErr := d.checkExistingVolume(req, requested)
+	d.controllerMu.Unlock()
+	if resp != nil || existingErr != nil {
+		return resp, existingErr
+	}
+	volumeOptions, err := d.pvcCreationSettings(ctx, req, requested)
+	if err != nil {
+		return nil, err
 	}
 
+	d.controllerMu.Lock()
+	defer d.controllerMu.Unlock()
+	if resp, err := d.checkExistingVolume(req, requested); resp != nil || err != nil {
+		return resp, err
+	}
+	return d.createVolumeLocked(ctx, req, volumeOptions)
+}
+
+func (d *Driver) createVolumeLocked(ctx context.Context, req *csi.CreateVolumeRequest,
+	volumeOptions *state.VolumeOptions) (*csi.CreateVolumeResponse, error) {
 	capacityBytes, err := capacityFromRange(req.CapacityRange)
 	if err != nil {
 		return nil, err
@@ -391,15 +398,22 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		return nil, err
 	}
 
-	opts := btrfs.CreateSubvolumeOptions{Nodatacow: nodatacow}
+	effective, err := d.sourceRootSettings(ctx, req.VolumeContentSource, volumeOptions.Creation)
+	if err != nil {
+		return nil, err
+	}
+	opts := btrfs.CreateSubvolumeOptions{Nodatacow: effective.Nodatacow}
 
 	vol := &state.Volume{
 		ID:            uuid.New().String(),
 		Name:          req.Name,
 		CapacityBytes: capacityBytes,
 		BasePath:      basePath,
-		Nodatacow:     nodatacow,
+		Nodatacow:     effective.Nodatacow,
+		Options:       volumeOptions,
 	}
+	vol.Options.Creation = effective
+	vol.Options.Applied = effective
 
 	if err := os.MkdirAll(filepath.Dir(vol.Path()), 0o750); err != nil {
 		return nil, status.Errorf(codes.Internal, "create volumes directory: %v", err)
@@ -411,11 +425,6 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	}
 	vol.SourceSnapID = sourceSnapID
 	vol.SourceVolID = sourceVolID
-
-	// For cloned volumes, inherit Nodatacow from the source, overriding the
-	// request parameter. btrfs snapshots always inherit the source's nodatacow
-	// property, so the on-disk reality must match the stored state.
-	d.inheritNodatacowFromSource(vol, sourceVolID, sourceSnapID)
 
 	// Clean up the subvolume on disk if any subsequent step fails, to prevent orphaned subvolumes.
 	cleanupNeeded := true
@@ -429,6 +438,12 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 			}
 		}
 	}()
+
+	if req.VolumeContentSource == nil {
+		if err := d.manager.ApplyRootSettings(ctx, vol.Path(), effective); err != nil {
+			return nil, status.Errorf(codes.Internal, "apply root settings: %v", err)
+		}
+	}
 
 	if err := d.applyCapacityLimit(ctx, basePath, vol.Path(), capacityBytes); err != nil {
 		return nil, status.Errorf(codes.Internal, "apply capacity limit: %v", err)
@@ -624,14 +639,19 @@ func (d *Driver) CreateSnapshot(ctx context.Context,
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "source volume %s not found", req.SourceVolumeId)
 	}
+	rootSettings, err := d.volumeRootSettings(ctx, srcVol)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "read snapshot source settings: %v", err)
+	}
 	id := uuid.New().String()
 	snap := &state.Snapshot{
-		ID:          id,
-		Name:        req.Name,
-		SourceVolID: req.SourceVolumeId,
-		BasePath:    basePath,
-		CreatedAt:   time.Now(),
-		ReadyToUse:  true,
+		ID:           id,
+		Name:         req.Name,
+		SourceVolID:  req.SourceVolumeId,
+		BasePath:     basePath,
+		CreatedAt:    time.Now(),
+		ReadyToUse:   true,
+		RootSettings: &rootSettings,
 	}
 
 	if err := os.MkdirAll(filepath.Dir(snap.Path()), 0o750); err != nil {
@@ -647,12 +667,7 @@ func (d *Driver) CreateSnapshot(ctx context.Context,
 		return nil, status.Errorf(codes.Internal, "create snapshot: %v", err)
 	}
 
-	// Populate SizeBytes from the snapshot's referenced data size. Best-effort:
-	// a failure here is non-fatal; SizeBytes stays 0.
-	if usage, err := d.manager.GetQgroupUsage(ctx, snap.Path()); err == nil && usage != nil {
-		//nolint:gosec // qgroup values always fit in int64
-		snap.SizeBytes = int64(usage.Referenced)
-	}
+	d.populateSnapshotSize(ctx, snap)
 
 	// Clean up the on-disk snapshot if SaveSnapshot fails, to prevent orphaned subvolumes.
 	cleanupNeeded := true
@@ -675,6 +690,14 @@ func (d *Driver) CreateSnapshot(ctx context.Context,
 
 	klog.V(4).InfoS("CreateSnapshot", "snapshotID", id, "name", req.Name, "sourceVolID", req.SourceVolumeId)
 	return &csi.CreateSnapshotResponse{Snapshot: toCSISnapshot(snap)}, nil
+}
+
+func (d *Driver) populateSnapshotSize(ctx context.Context, snap *state.Snapshot) {
+	// A usage lookup failure is non-fatal; SizeBytes stays 0.
+	if usage, err := d.manager.GetQgroupUsage(ctx, snap.Path()); err == nil && usage != nil {
+		//nolint:gosec // qgroup values always fit in int64
+		snap.SizeBytes = int64(usage.Referenced)
+	}
 }
 
 //nolint:dupl // DeleteSnapshot and DeleteVolume must have parallel structure per CSI spec

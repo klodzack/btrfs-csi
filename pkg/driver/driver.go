@@ -49,6 +49,10 @@ type Driver struct {
 	grpcServer grpcStopper
 	manager    btrfs.Manager
 	store      state.Store
+	pvcClient  PVCClient
+
+	optionWarningsMu sync.Mutex
+	optionWarnings   map[string]optionWarning
 
 	// controllerMu serializes mutating controller operations (Create/Delete/Expand)
 	// to prevent races between concurrent modifications (e.g. delete + clone).

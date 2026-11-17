@@ -18,6 +18,11 @@ type QgroupLimitCall struct {
 // MockManager is a test double that implements Manager.
 // It records all method calls and returns pre-configured results.
 type MockManager struct {
+	RootSettingsResult     RootSettings
+	GetRootSettingsErr     error
+	ApplyRootSettingsErr   error
+	RootSettingsByPath     map[string]RootSettings
+	ApplyRootSettingsCalls []RootSettingsCall
 	// CreateSubvolume
 	CreateSubvolumeCalls     []string
 	CreateSubvolumeOptsCalls []CreateSubvolumeOptions
@@ -75,6 +80,38 @@ type MockManager struct {
 	IsMountpointResult bool
 	IsMountpointErr    error
 	IsMountpointFunc   func(path string) (bool, error)
+}
+
+// RootSettingsCall records a root-only settings update.
+type RootSettingsCall struct {
+	Path     string
+	Settings RootSettings
+}
+
+func (m *MockManager) GetRootSettings(_ context.Context, path string) (RootSettings, error) {
+	if settings, ok := m.RootSettingsByPath[path]; ok {
+		return settings, m.GetRootSettingsErr
+	}
+	settings := m.RootSettingsResult
+	if settings.Compression == "" {
+		settings.Compression = "inherit"
+		if settings.Nodatacow {
+			settings.Compression = "none"
+		}
+	}
+	return settings, m.GetRootSettingsErr
+}
+
+func (m *MockManager) ApplyRootSettings(_ context.Context, path string, settings RootSettings) error {
+	m.ApplyRootSettingsCalls = append(m.ApplyRootSettingsCalls, RootSettingsCall{path, settings})
+	if m.ApplyRootSettingsErr != nil {
+		return m.ApplyRootSettingsErr
+	}
+	if m.RootSettingsByPath == nil {
+		m.RootSettingsByPath = make(map[string]RootSettings)
+	}
+	m.RootSettingsByPath[path] = settings
+	return nil
 }
 
 func (m *MockManager) CreateSubvolume(ctx context.Context, path string, opts CreateSubvolumeOptions) error {

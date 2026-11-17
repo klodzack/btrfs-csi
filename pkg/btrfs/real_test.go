@@ -315,7 +315,7 @@ func TestParseQgroupShow_MalformedMaxRfer(t *testing.T) {
 }
 
 // TestRealManagerCreateSubvolume_WithNodatacow verifies that
-// CreateSubvolume with Nodatacow: true calls btrfs subvolume create then chattr +C.
+// CreateSubvolume with Nodatacow: true safely disables compression before chattr +C.
 func TestRealManagerCreateSubvolume_WithNodatacow(t *testing.T) {
 	// Save and restore the original runCommand.
 	savedRunCmd := runCommand
@@ -328,6 +328,9 @@ func TestRealManagerCreateSubvolume_WithNodatacow(t *testing.T) {
 	var calls []cmdCall
 	runCommand = func(_ context.Context, name string, args ...string) (string, error) {
 		calls = append(calls, cmdCall{name: name, args: args})
+		if name == "lsattr" {
+			return "---------------------- /test/path", nil
+		}
 		return "", nil
 	}
 
@@ -337,8 +340,8 @@ func TestRealManagerCreateSubvolume_WithNodatacow(t *testing.T) {
 		t.Fatalf("CreateSubvolume: %v", err)
 	}
 
-	if len(calls) != 2 {
-		t.Fatalf("expected 2 commands, got %d: %v", len(calls), calls)
+	if len(calls) != 5 {
+		t.Fatalf("expected 5 commands, got %d: %v", len(calls), calls)
 	}
 
 	// First command: btrfs subvolume create <path> (without --nodatacow)
@@ -352,12 +355,11 @@ func TestRealManagerCreateSubvolume_WithNodatacow(t *testing.T) {
 		t.Errorf("unexpected --nodatacow in first command args: %v", calls[0].args)
 	}
 
-	// Second command: chattr +C <path>
-	if calls[1].name != "chattr" {
-		t.Errorf("expected second command 'chattr', got %q", calls[1].name)
+	if !slices.Equal(calls[3].args, []string{"property", "set", "/test/path", "compression", "none"}) {
+		t.Errorf("compression must be disabled before NOCOW: %v", calls[3])
 	}
-	if len(calls[1].args) != 2 || calls[1].args[0] != "+C" || calls[1].args[1] != "/test/path" {
-		t.Errorf("expected second command args [+C /test/path], got %v", calls[1].args)
+	if calls[4].name != "chattr" || !slices.Equal(calls[4].args, []string{"+C", "/test/path"}) {
+		t.Errorf("expected final command chattr +C /test/path, got %v", calls[4])
 	}
 }
 
@@ -404,10 +406,11 @@ func TestRealManagerCreateSubvolume_WithNodatacow_ChattrFails(t *testing.T) {
 	savedRunCmd := runCommand
 	t.Cleanup(func() { runCommand = savedRunCmd })
 
-	callCount := 0
 	runCommand = func(_ context.Context, name string, args ...string) (string, error) {
-		callCount++
-		if callCount == 2 {
+		if name == "lsattr" {
+			return "---------------------- /test/path", nil
+		}
+		if name == "chattr" {
 			return "", fmt.Errorf("operation not permitted")
 		}
 		return "", nil
